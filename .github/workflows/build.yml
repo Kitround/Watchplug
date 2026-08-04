@@ -7,43 +7,82 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The release step attaches the .ipk to the tag, which the default read-only token
+# The release job attaches packages to the tag, which the default read-only token
 # is not allowed to do.
 permissions:
   contents: write
 
 jobs:
-  build:
+  test:
+    name: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # make-ipk.sh derives the release number from the commit count
 
+      # Pure helpers: duration parser, backoff thresholds, URL encoding, password
+      # masking, and the clamps guarding a hand-edited conffile.
       - name: selftest
-        run: sh package/files/usr/sbin/watchplug selftest
+        run: sh luci-app-watchplug/root/usr/sbin/watchplug selftest
 
-      # Guards the state machine itself -- retry spacing, the 24h cap, rearm, the
-      # outage clock surviving a restart, and that neither preset writes the device
-      # password into the activity log. Nothing else covers any of that.
-      - name: test daemon
+      # The state machine itself, against a stubbed uci / ping / HTTP device.
+      - name: daemon
         run: sh test-daemon.sh
 
-      - name: build ipk
+  # One build per OpenWrt release. The package is LUCI_PKGARCH:=all, so a single
+  # architecture per release covers every target -- what changes between releases is
+  # the packaging itself, and each SDK emits its own release's format: .ipk through
+  # 24.10, .apk from 25.12, where apk replaced opkg.
+  build:
+    name: openwrt ${{ matrix.release }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [ '21.02.7', '22.03.6', '23.05.6', '24.10.8', '25.12.5' ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build with the OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: x86_64-${{ matrix.release }}
+          FEEDNAME: watchplug
+          PACKAGES: luci-app-watchplug
+
+      # Every release builds the same filename, so the OpenWrt version goes into the
+      # name or the release assets would collide. The extension is kept as built.
+      - name: name the package after its OpenWrt release
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            export VERSION="${GITHUB_REF_NAME#v}"
-          fi
-          sh make-ipk.sh
+          mkdir -p dist
+          found=0
+          for f in $(find . -type f \( -name 'luci-app-watchplug*.ipk' -o -name 'luci-app-watchplug*.apk' \)); do
+            cp "$f" "dist/luci-app-watchplug_openwrt-${{ matrix.release }}_all.${f##*.}"
+            found=1
+          done
+          [ "$found" = 1 ] || { echo "no package produced"; find . -name '*.ipk' -o -name '*.apk'; exit 1; }
+          ls -l dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: luci-app-watchplug
-          path: '*.ipk'
+          name: openwrt-${{ matrix.release }}
+          path: dist/*
+          if-no-files-found: error
 
-      - name: release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+  release:
+    name: release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: '*.ipk'
+          path: dist
+          merge-multiple: true
+
+      - run: ls -l dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
           generate_release_notes: true

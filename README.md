@@ -10,12 +10,23 @@ any HTTP device.
 
 ## Compatibility
 
-Verified on **OpenWrt 21.02**. Architecture `all` — pure shell and JavaScript, nothing compiled —
-so it installs on any target, and it needs only `luci-base` and `jshn`, both on a stock image.
+A package is built and published for each supported release, with the official OpenWrt SDK for that
+release:
 
-Later opkg releases (22.03, 23.05, 24.10) should work unchanged, though they are untested. It will
-not work below 21.02, where LuCI still rendered server-side, nor on an `apk`-based OpenWrt, which
-cannot install an `.ipk`.
+| OpenWrt | Package |
+|---|---|
+| 21.02 | `.ipk` |
+| 22.03 | `.ipk` |
+| 23.05 | `.ipk` |
+| 24.10 | `.ipk` |
+| 25.12 | `.apk` — 25.12 replaced opkg with apk |
+
+Pick the one matching your release. Architecture is `all` — pure shell and JavaScript, nothing
+compiled — so a single package covers every target, from an ath79 router to x86. It needs only
+`luci-base` and `jshn`, both on a stock image.
+
+Below 21.02 it will not work at all: the UI is built on the client-side LuCI JS API, and an older
+LuCI renders its pages server-side.
 
 ## Supported devices
 
@@ -45,34 +56,36 @@ cannot install an `.ipk`.
 
 ### From LuCI, no SSH needed
 
-1. Open the [releases page](https://github.com/Kitround/Watchplug/releases/latest) and, under
-   **Assets**, download `luci-app-watchplug_<version>_all.ipk`. Save it on the machine your browser
-   runs on — not on the router.
-2. In LuCI, open **System → Software**.
-3. Click **Upload Package…**, pick the `.ipk`, and confirm.
-4. A dialog shows the package name and size. Click **Install**.
-5. Reload the page. Watchplug appears under **Services → Watchplug**.
+1. Check your release with `cat /etc/openwrt_release | grep RELEASE`, or read it off the LuCI
+   overview page.
+2. On the [releases page](https://github.com/Kitround/Watchplug/releases/latest), under **Assets**,
+   download `luci-app-watchplug_openwrt-<your release>_all.ipk` — or `.apk` on 25.12. Save it on
+   the machine your browser runs on, not on the router.
+3. In LuCI, open **System → Software**.
+4. Click **Upload Package…**, pick the file, and confirm.
+5. A dialog shows the package name and size. Click **Install**.
+6. Reload the page. Watchplug appears under **Services → Watchplug**.
 
 If the menu entry does not show up, force-refresh the browser (`Ctrl`/`Cmd` + `Shift` + `R`) or log
 out and back in: LuCI caches its menu, and the install clears that cache server-side only.
 
-Uploading a version already installed does nothing: opkg reports it as up to date and stops there.
-Putting that same version back — after a botched upgrade, say — needs `--force-reinstall`, which
-the GUI does not pass, so use the shell instead. Installing a *newer* version over an older one
-works fine from the GUI.
+Uploading a version already installed does nothing — it is reported as up to date. Putting that
+same version back, after a botched upgrade say, needs `--force-reinstall`, which the GUI does not
+pass, so use the shell instead. Installing a *newer* version over an older one works from the GUI.
 
 ### From the router's shell
 
+Download the asset matching your release from the [releases page](https://github.com/Kitround/Watchplug/releases/latest),
+copy it to the router with `scp`, then:
+
 ```bash
-opkg install --force-reinstall https://github.com/Kitround/Watchplug/releases/latest/download/luci-app-watchplug_1.0.1-1_all.ipk
+opkg install --force-reinstall /tmp/luci-app-watchplug_openwrt-24.10_all.ipk
 ```
 
-The filename carries the version, so check the [releases page](https://github.com/Kitround/Watchplug/releases/latest)
-for the current one. If the router cannot reach GitHub, download the file elsewhere, copy it over
-with `scp`, and install from the local path:
+On 25.12 and later, where apk replaced opkg:
 
 ```bash
-opkg install --force-reinstall /tmp/luci-app-watchplug_1.0.1-1_all.ipk
+apk add --allow-untrusted /tmp/luci-app-watchplug_openwrt-25.12_all.apk
 ```
 
 ### Either way

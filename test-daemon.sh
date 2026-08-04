@@ -4,7 +4,7 @@
 set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
-BIN=$here/package/files/usr/sbin/watchplug
+BIN=$here/luci-app-watchplug/root/usr/sbin/watchplug
 tmp=${TMPDIR:-/tmp}/watchplug-test.$$
 mkdir -p "$tmp/bin"
 # rm last on purpose: the trap's final command sets the script's exit status, and a

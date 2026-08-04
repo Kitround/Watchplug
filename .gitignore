@@ -1,5 +1,8 @@
-build/
+# SDK build output
+bin/
+dist/
 *.ipk
+*.apk
 
 # Agent notes: useful to whoever edits this, useless to whoever installs it.
 CLAUDE.md
