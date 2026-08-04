@@ -149,8 +149,14 @@ expect 20 blocked
 [ "$(cycles)" -eq 2 ] || { echo "FAIL: $(cycles) cycles instead of 2" >&2; exit 1; }
 echo "ok: 24h cap honoured, no further cycle while blocked"
 
-# backoff is off, so the second attempt must come one down_time later, not two
-set -- $(grep Backlog "$FETCHLOG" | cut -d' ' -f1)
+# backoff is off, so the second attempt must come one down_time later, not two.
+#
+# Measured on the cycle history, not on the fetch log. The daemon stamps a cycle with
+# the time the tick started, while the request itself goes out after poll_all and
+# check_conn have run -- a gap that grows with how slow the box is. Timing the
+# fetches was timing that delay as much as the spacing, and it is what made this
+# assertion flaky on CI.
+set -- $(cat "$tmp/watchplug.cycles")
 gap=$(( $2 - $1 ))
 [ "$gap" -ge 2 ] || { echo "FAIL: retries $gap s apart, expected at least down_time=2" >&2; exit 1; }
 [ "$gap" -le 4 ] || { echo "FAIL: retries $gap s apart, backoff is disabled so it should stay near 2" >&2; exit 1; }
@@ -280,6 +286,55 @@ grep -q 's3cr3tpw' "$LOG" && {
 grep -q 'pw=\*\*\*' "$LOG" || {
 	echo "FAIL: custom URL not masked in the activity log" >&2; tail -3 "$LOG" >&2; exit 1; }
 echo "ok: custom preset expanded, password masked outside a 'password=' parameter"
+
+echo "# a cycle is written down before it is fired, not after"
+# A chained cycle runs for as long as device_delay times the device count, and procd
+# restarts this daemon on every config change. If the record came after the commands,
+# a restart inside that window would lose it and cycle everything again. Proven with a
+# slow device rather than by racing a kill: the record must already be there while the
+# request is still in flight.
+# Own config, one Tasmota device: earlier tests leave a custom-URL device behind, and
+# a custom reply cannot be validated, so a refusal there still counts as taken.
+cat >"$CFG" <<'EOF'
+watchplug.@device[0]=device
+watchplug.@device[0].name=plugA
+watchplug.@device[0].host=192.0.2.9
+watchplug.@device[0].relay=Power
+watchplug.@device[0].off_time=1
+EOF
+cat >"$tmp/bin/uclient-fetch" <<EOF
+#!/bin/sh
+for a in "\$@"; do url=\$a; done
+echo "\$(date +%s) \$url" >>"$FETCHLOG"
+case "\$url" in *Backlog*) sleep 4 ;; esac
+echo '{"Backlog":"Done"}'
+EOF
+chmod +x "$tmp/bin/uclient-fetch"
+rm -f "$tmp/watchplug.cycles"
+"$BIN" cycle >/dev/null 2>&1 &
+cycle_pid=$!
+sleep 2
+[ -s "$tmp/watchplug.cycles" ] || {
+	echo "FAIL: the cycle was not recorded before the command went out" >&2
+	kill $cycle_pid 2>/dev/null; exit 1; }
+echo "ok: recorded while the command is still in flight"
+kill $cycle_pid 2>/dev/null
+wait $cycle_pid 2>/dev/null || true
+
+echo "# a cycle that reached no device is not counted against the cap"
+cat >"$tmp/bin/uclient-fetch" <<EOF
+#!/bin/sh
+for a in "\$@"; do url=\$a; done
+echo "\$(date +%s) \$url" >>"$FETCHLOG"
+echo '{"Command":"Unknown"}'
+EOF
+chmod +x "$tmp/bin/uclient-fetch"
+: >"$tmp/watchplug.cycles"
+"$BIN" cycle >/dev/null 2>&1 && { echo "FAIL: a refused cycle reported success" >&2; exit 1; }
+[ -s "$tmp/watchplug.cycles" ] && {
+	echo "FAIL: a cycle nothing took still counts against the 24h cap" >&2
+	cat "$tmp/watchplug.cycles" >&2; exit 1; }
+echo "ok: a refused cycle leaves the history untouched"
 
 echo "# a config written before multiple devices is still driven"
 cat >"$tmp/bin/uclient-fetch" <<EOF

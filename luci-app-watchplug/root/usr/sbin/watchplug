@@ -504,6 +504,21 @@ record_cycle() { # record_cycle <now>
 	echo "$_kept $1" >"$CYCLES_FILE"
 }
 
+# Takes a timestamp back out of the history. A cycle is written down before the
+# commands go out, so nothing is lost if the daemon dies mid-cycle; this undoes that
+# when it turns out no device took its command. The cap counts equipment actually
+# switched, and an attempt that reached nothing did not switch anything.
+unrecord_cycle() { # unrecord_cycle <ts>
+	_keep=
+	for _t in $(cat "$CYCLES_FILE" 2>/dev/null); do
+		[ "$_t" = "$1" ] || _keep="$_keep $_t"
+	done
+	# printf, not echo: with nothing left the file has to be empty, not hold a blank
+	# line. Word splitting would not care, but "is there any cycle on record" is a
+	# question worth being able to answer by looking at the file.
+	printf '%s' "${_keep# }" >"$CYCLES_FILE"
+}
+
 # --- state --------------------------------------------------------------------
 
 # Polls every configured device and builds both the JSON array the page reads and
@@ -673,12 +688,18 @@ tick() {
 		state=blocked
 		message="cap of $max_cycles cycles per 24h reached"
 	elif [ $((now - since)) -ge "$thr" ]; then
+		# Written down before the commands go out, not after. cycle_all can take a
+		# long time -- a chain waits device_delay between devices -- and procd
+		# restarts this daemon on every config change. A restart landing inside that
+		# window would find no record, decide the threshold had passed, and cycle
+		# everything a second time. Undone below if nothing was actually switched.
+		#
 		# One cycle is recorded whatever the device count: the cap and the backoff
 		# are counting outages, not hardware.
+		record_cycle "$now"
 		if cycle_all; then
 			last_cycle=$now
 			since=$now
-			record_cycle "$now"
 			cycles_24h=$((cycles_24h + 1))
 			cooldown_until=$((now + recovery_grace))
 			state=cooldown
@@ -686,6 +707,7 @@ tick() {
 			# page does not show pre-cycle states until the next tick.
 			poll_all
 		else
+			unrecord_cycle "$now"
 			message="no device could be cycled"
 		fi
 	fi
@@ -925,13 +947,15 @@ cycle)
 	load_config
 	cycle_ts=$(date +%s)
 	log info "manual cycle requested${2:+ for $2}"
+	# Recorded first for the same reason as the daemon: a chained cycle can run for
+	# minutes, and nothing should be able to lose the fact that it happened.
+	record_cycle "$cycle_ts"
 	if [ -n "$2" ]; then
 		load_device "$2"
-		do_cycle || exit 1
+		do_cycle || { unrecord_cycle "$cycle_ts"; exit 1; }
 	else
-		cycle_all || exit 1
+		cycle_all || { unrecord_cycle "$cycle_ts"; exit 1; }
 	fi
-	record_cycle "$cycle_ts"
 	;;
 rearm)
 	cleared=$(wc -w <"$CYCLES_FILE" 2>/dev/null || echo 0)
