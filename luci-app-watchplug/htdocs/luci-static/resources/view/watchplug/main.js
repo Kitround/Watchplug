@@ -4,6 +4,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require uci';
 'require network';
 'require tools.widgets as widgets';
 
@@ -442,27 +443,40 @@ return view.extend({
 		o = duration_option(s, 'ping_timeout', _('Ping timeout'), null, '3s', 60);
 		o.optional = true;
 
-		// Anonymous sections of type 'device', added and removed from the page, the way
-		// LuCI models a list of like things everywhere else.
-		s = m.section(form.TypedSection, 'device', _('Devices'),
-			_('Any device with an HTTP API: smart plug, relay board, home-automation hub. Give each a static address the router can reach. Add as many as you need — they are all driven together when the link stays down.'));
+		// A GridSection, not a flat list of sections: one row per device, the details
+		// behind Edit. A TypedSection stacks every option of every device into one
+		// column, and with fifteen options each there is nothing showing where one
+		// device ends and the next begins. This is how LuCI lists things it has many
+		// of -- firewall forwards are built exactly this way.
+		s = m.section(form.GridSection, 'device', _('Devices'),
+			_('Any device with an HTTP API: smart plug, relay board, home-automation hub. Give each a static address the router can reach. Add as many as you need — they are all driven when the link stays down.'));
 		s.anonymous = true;
 		s.addremove = true;
 		s.addbtntitle = _('Add device');
+		s.nodescriptions = true;
 
-		o = s.option(form.Flag, 'enabled', _('Cycle this device'),
+		s.sectiontitle = function(section_id) {
+			return uci.get('watchplug', section_id, 'name') || _('Unnamed device');
+		};
+
+		// modalonly false: shown as a column in the table. The four below are what
+		// tells two devices apart at a glance.
+		o = s.option(form.Value, 'name', _('Name'),
+			_('Shown on the status page, on its buttons and in the log.'));
+		o.placeholder = _('ONT, modem, camera…');
+		o.modalonly = false;
+
+		o = s.option(form.Flag, 'enabled', _('Cycled'),
 			_('Unchecked, the device is left alone by the automatic cycle but stays visible and drivable by hand.'));
 		o.default = '1';
 		o.rmempty = false;
-
-		o = s.option(form.Value, 'name', _('Name'),
-			_('Shown on the status page, on its buttons and in the log. Useful once there is more than one.'));
-		o.placeholder = _('ONT, modem, camera…');
+		o.modalonly = false;
 
 		o = s.option(form.ListValue, 'preset', _('Device type'));
 		o.value('tasmota', _('Tasmota (built-in)'));
 		o.value('custom', _('Custom HTTP URLs'));
 		o.default = 'tasmota';
+		o.modalonly = false;
 
 		o = s.option(form.Value, 'host', _('Device address'),
 			_('Pick a host the router already knows, or type an address. Used by the Tasmota preset, and available as <code>{host}</code> in custom URLs.'));
@@ -471,11 +485,15 @@ return view.extend({
 		// Adding choices turns the field into a Combobox, which forces create=true --
 		// a device on a static address, outside any DHCP lease, stays typeable.
 		hostChoices(hints).forEach(function(c) { o.value(c[0], c[1]); });
+		o.modalonly = false;
 
+		// Everything below lives in the Edit dialog: fifteen options per device in the
+		// table would put us back where we started.
 		o = s.option(form.Value, 'port', _('HTTP port'));
 		o.datatype = 'port';
 		o.placeholder = '80';
 		o.optional = true;
+		o.modalonly = true;
 
 		o = s.option(form.ListValue, 'relay', _('Relay'),
 			_('"Power" for a single-relay device such as the Shelly Plug S.'));
@@ -485,35 +503,43 @@ return view.extend({
 		o.value('Power3', 'Power3');
 		o.value('Power4', 'Power4');
 		o.depends('preset', 'tasmota');
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'user', _('Username'), _('Leave empty if web authentication is disabled.'));
 		o.optional = true;
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'password', _('Password'));
 		o.password = true;
 		o.optional = true;
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'url_on', _('Switch-on URL'),
 			_('Placeholders: <code>{host} {port} {user} {password} {off_time} {off_ds}</code>. <code>{off_ds}</code> is the off time in tenths of a second.'));
 		o.placeholder = 'http://{host}/relay/0?turn=on';
 		o.depends('preset', 'custom');
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'url_off', _('Switch-off URL'));
 		o.placeholder = 'http://{host}/relay/0?turn=off';
 		o.depends('preset', 'custom');
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'url_cycle', _('Cycle URL (recommended)'),
 			_('A single call that switches off and back on after the delay, timed <em>by the device</em>. Leave empty to have the router hold the timer instead — but then a router reboot during the window leaves the device off.'));
 		o.placeholder = 'http://{host}/relay/0?turn=off&timer={off_time}';
 		o.depends('preset', 'custom');
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'url_state', _('State URL'), _('Optional, polled to show the current state.'));
 		o.placeholder = 'http://{host}/relay/0';
 		o.depends('preset', 'custom');
+		o.modalonly = true;
 
 		o = s.option(form.Value, 'state_key', _('State JSON key'),
 			_('Key to read in the state URL reply, e.g. <code>ison</code>. Empty shows the raw reply.'));
 		o.depends('preset', 'custom');
+		o.modalonly = true;
 
 		o = duration_option(s, 'off_time', _('Off time'),
 			_('How long the device stays off during a cycle, automatic or via the <em>Force off/on cycle</em> button — it switches back on by itself after this. With the Tasmota preset the delay is run <em>by the device</em> (<code>Backlog Power off; Delay …; Power on</code>), so it survives a router reboot mid-cycle — and is capped at 6 min, which is Tasmota\'s own ceiling. A custom cycle URL has no such limit.'),
@@ -522,14 +548,17 @@ return view.extend({
 				return (p && p[0] && p[0].formvalue(p[1]) != 'tasmota') ? 0 : 360;
 			});
 		o.rmempty = false;
+		o.modalonly = true;
 
 		o = duration_option(s, 'http_timeout', _('HTTP timeout'), null, '5s', 60);
 		o.optional = true;
+		o.modalonly = true;
 
 		o = s.option(form.Flag, 'enforce_poweronstate', _('Enforce PowerOnState = ON'),
 			_('Automatically fixes the device so it powers back up when mains returns. Without this, a mains outage while it is off leaves the controlled equipment dead indefinitely.'));
 		o.rmempty = false;
 		o.depends('preset', 'tasmota');
+		o.modalonly = true;
 
 		m.section(PaneSection, 'main', 'logs', _('Logs'), function() {
 			return [
