@@ -17,7 +17,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pure helpers: duration parser, backoff thresholds, URL encoding, password
       # masking, and the clamps guarding a hand-edited conffile.
@@ -49,7 +49,7 @@ jobs:
           - sdk: '25.12.5'
             label: '25.12'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: build with the OpenWrt ${{ matrix.sdk }} SDK
         uses: openwrt/gh-action-sdk@main
@@ -71,7 +71,7 @@ jobs:
           [ "$found" = 1 ] || { echo "no package produced"; find . -name '*.ipk' -o -name '*.apk'; exit 1; }
           ls -l dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: openwrt-${{ matrix.label }}
           path: dist/*
@@ -83,14 +83,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - run: ls -l dist/
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
