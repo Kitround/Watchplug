@@ -198,8 +198,27 @@ function refresh() {
 	});
 }
 
+// Confirmations expire, failures do not: a banner saying the device refused the
+// command is the only place that reason is shown, and it must not vanish while the
+// user is reading it. LuCI grew addTimeLimitedNotification in 24.10, so on 21.02
+// through 23.05 the plain banner is faded out here instead.
+var NOTIFY_MS = 5000;
+
 function notify(ok, text) {
-	ui.addNotification(null, E('p', [ text ]), ok ? 'info' : 'error');
+	var cls = ok ? 'info' : 'error';
+
+	if (!ok)
+		return ui.addNotification(null, E('p', [ text ]), cls);
+
+	if (typeof ui.addTimeLimitedNotification == 'function')
+		return ui.addTimeLimitedNotification(null, E('p', [ text ]), NOTIFY_MS, cls);
+
+	var node = ui.addNotification(null, E('p', [ text ]), cls);
+	window.setTimeout(function() {
+		if (node && node.parentNode)
+			node.parentNode.removeChild(node);
+	}, NOTIFY_MS);
+	return node;
 }
 
 function action(label, fn) {
