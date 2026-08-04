@@ -28,36 +28,44 @@ jobs:
       - name: daemon
         run: sh test-daemon.sh
 
-  # One build per OpenWrt release. The package is LUCI_PKGARCH:=all, so a single
-  # architecture per release covers every target -- what changes between releases is
-  # the packaging itself, and each SDK emits its own release's format: .ipk through
-  # 24.10, .apk from 25.12, where apk replaced opkg.
+  # Two packages, not one per release. The app is LUCI_PKGARCH:=all -- shell and
+  # JavaScript, no ABI, no versioned dependency -- so what actually splits the
+  # releases is the container format, and there are only two of them: opkg's .ipk up
+  # to 24.10, and apk's from 25.12, which replaced opkg.
+  #
+  # The .ipk is built with the *oldest* supported SDK on purpose: a 21.02 package
+  # installs on every later opkg, while a 24.10-built one carries metadata 21.02 may
+  # not know. Compatibility runs forward, so build at the floor.
   build:
-    name: openwrt ${{ matrix.release }}
+    name: openwrt ${{ matrix.label }}
     needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        release: [ '21.02.7', '22.03.6', '23.05.6', '24.10.8', '25.12.5' ]
+        include:
+          - sdk: '21.02.7'
+            label: '21.02-24.10'
+          - sdk: '25.12.5'
+            label: '25.12'
     steps:
       - uses: actions/checkout@v4
 
-      - name: build with the OpenWrt SDK
+      - name: build with the OpenWrt ${{ matrix.sdk }} SDK
         uses: openwrt/gh-action-sdk@main
         env:
-          ARCH: x86_64-${{ matrix.release }}
+          ARCH: x86_64-${{ matrix.sdk }}
           FEEDNAME: watchplug
           PACKAGES: luci-app-watchplug
 
-      # Every release builds the same filename, so the OpenWrt version goes into the
-      # name or the release assets would collide. The extension is kept as built.
-      - name: name the package after its OpenWrt release
+      # Both builds produce the same filename, so the release range goes into the
+      # name. The extension is whatever the SDK emitted -- it is the whole point.
+      - name: name the package after the releases it covers
         run: |
           mkdir -p dist
           found=0
           for f in $(find . -type f \( -name 'luci-app-watchplug*.ipk' -o -name 'luci-app-watchplug*.apk' \)); do
-            cp "$f" "dist/luci-app-watchplug_openwrt-${{ matrix.release }}_all.${f##*.}"
+            cp "$f" "dist/luci-app-watchplug_openwrt-${{ matrix.label }}_all.${f##*.}"
             found=1
           done
           [ "$found" = 1 ] || { echo "no package produced"; find . -name '*.ipk' -o -name '*.apk'; exit 1; }
@@ -65,7 +73,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: openwrt-${{ matrix.release }}
+          name: openwrt-${{ matrix.label }}
           path: dist/*
           if-no-files-found: error
 

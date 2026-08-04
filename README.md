@@ -10,20 +10,20 @@ any HTTP device.
 
 ## Compatibility
 
-A package is built and published for each supported release, with the official OpenWrt SDK for that
+Two packages are published, built with the official OpenWrt SDK. Take the one matching your
 release:
 
-| OpenWrt | Package |
+| Your OpenWrt | Download |
 |---|---|
-| 21.02 | `.ipk` |
-| 22.03 | `.ipk` |
-| 23.05 | `.ipk` |
-| 24.10 | `.ipk` |
-| 25.12 | `.apk` — 25.12 replaced opkg with apk |
+| 21.02, 22.03, 23.05, 24.10 | `luci-app-watchplug_openwrt-21.02-24.10_all.ipk` |
+| 25.12 and later | `luci-app-watchplug_openwrt-25.12_all.apk` |
 
-Pick the one matching your release. Architecture is `all` — pure shell and JavaScript, nothing
-compiled — so a single package covers every target, from an ath79 router to x86. It needs only
-`luci-base` and `jshn`, both on a stock image.
+One file covers the whole opkg range because the app is architecture `all` — pure shell and
+JavaScript, no ABI, no versioned dependency — and the `.ipk` container did not change across those
+releases. 25.12 is separate because it replaced opkg with apk, a different format entirely.
+
+It needs only `luci-base` and `jshn`, both on a stock image, and installs on any target from an
+ath79 router to x86.
 
 Below 21.02 it will not work at all: the UI is built on the client-side LuCI JS API, and an older
 LuCI renders its pages server-side.
@@ -56,11 +56,10 @@ LuCI renders its pages server-side.
 
 ### From LuCI, no SSH needed
 
-1. Check your release with `cat /etc/openwrt_release | grep RELEASE`, or read it off the LuCI
-   overview page.
+1. Check your release on the LuCI overview page, or with `grep RELEASE /etc/openwrt_release`.
 2. On the [releases page](https://github.com/Kitround/Watchplug/releases/latest), under **Assets**,
-   download `luci-app-watchplug_openwrt-<your release>_all.ipk` — or `.apk` on 25.12. Save it on
-   the machine your browser runs on, not on the router.
+   download the file for your release from the table above. Save it on the machine your browser
+   runs on, not on the router.
 3. In LuCI, open **System → Software**.
 4. Click **Upload Package…**, pick the file, and confirm.
 5. A dialog shows the package name and size. Click **Install**.
@@ -79,7 +78,7 @@ Download the asset matching your release from the [releases page](https://github
 copy it to the router with `scp`, then:
 
 ```bash
-opkg install --force-reinstall /tmp/luci-app-watchplug_openwrt-24.10_all.ipk
+opkg install --force-reinstall /tmp/luci-app-watchplug_openwrt-21.02-24.10_all.ipk
 ```
 
 On 25.12 and later, where apk replaced opkg:
