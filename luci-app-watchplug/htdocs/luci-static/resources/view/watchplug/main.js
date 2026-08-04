@@ -459,24 +459,25 @@ return view.extend({
 			return uci.get('watchplug', section_id, 'name') || _('Unnamed device');
 		};
 
-		// modalonly false: shown as a column in the table. The four below are what
-		// tells two devices apart at a glance.
+		// The four below are left with modalonly unset, which is not the same as
+		// false. LuCI picks columns with "if (opt.modalonly) continue" and modal
+		// contents with "if (opt.modalonly === false) continue": unset puts an option
+		// in both, false puts it in the table and *removes it from the Edit dialog*.
+		// preset has to be in the dialog or every depends('preset', ...) below it can
+		// never resolve, which hides the relay and all five custom URLs.
 		o = s.option(form.Value, 'name', _('Name'),
 			_('Shown on the status page, on its buttons and in the log.'));
 		o.placeholder = _('ONT, modem, camera…');
-		o.modalonly = false;
 
 		o = s.option(form.Flag, 'enabled', _('Cycled'),
 			_('Unchecked, the device is left alone by the automatic cycle but stays visible and drivable by hand.'));
 		o.default = '1';
 		o.rmempty = false;
-		o.modalonly = false;
 
 		o = s.option(form.ListValue, 'preset', _('Device type'));
 		o.value('tasmota', _('Tasmota (built-in)'));
 		o.value('custom', _('Custom HTTP URLs'));
 		o.default = 'tasmota';
-		o.modalonly = false;
 
 		o = s.option(form.Value, 'host', _('Device address'),
 			_('Pick a host the router already knows, or type an address. Used by the Tasmota preset, and available as <code>{host}</code> in custom URLs.'));
@@ -485,7 +486,6 @@ return view.extend({
 		// Adding choices turns the field into a Combobox, which forces create=true --
 		// a device on a static address, outside any DHCP lease, stays typeable.
 		hostChoices(hints).forEach(function(c) { o.value(c[0], c[1]); });
-		o.modalonly = false;
 
 		// Everything below lives in the Edit dialog: fifteen options per device in the
 		// table would put us back where we started.
