@@ -37,18 +37,44 @@ shell and JavaScript — so it installs on any target without an SDK or cross-co
 
 ## Installation
 
-From the router, using the latest release — the exact filename is on the releases page, since the
-release number tracks the commit count:
+### From LuCI, no SSH needed
+
+1. Open the [releases page](https://github.com/Kitround/Watchplug/releases/latest) and, under
+   **Assets**, download `luci-app-watchplug_<version>_all.ipk`. Save it on the machine your browser
+   runs on — not on the router.
+2. In LuCI, open **System → Software**.
+3. Click **Upload Package…**, pick the `.ipk`, and confirm.
+4. A dialog shows the package name and size. Click **Install**.
+5. Reload the page. Watchplug appears under **Services → Watchplug**.
+
+If the menu entry does not show up, force-refresh the browser (`Ctrl`/`Cmd` + `Shift` + `R`) or log
+out and back in: LuCI caches its menu, and the install clears that cache server-side only.
+
+Uploading a version already installed does nothing: opkg reports it as up to date and stops there.
+Putting that same version back — after a botched upgrade, say — needs `--force-reinstall`, which
+the GUI does not pass, so use the shell instead. Installing a *newer* version over an older one
+works fine from the GUI.
+
+### From the router's shell
 
 ```bash
 opkg install --force-reinstall https://github.com/Kitround/Watchplug/releases/latest/download/luci-app-watchplug_1.0.1-1_all.ipk
 ```
 
-Or entirely from the GUI: *LuCI → System → Software → Upload Package…* with the `.ipk`.
+The filename carries the version, so check the [releases page](https://github.com/Kitround/Watchplug/releases/latest)
+for the current one. If the router cannot reach GitHub, download the file elsewhere, copy it over
+with `scp`, and install from the local path:
+
+```bash
+opkg install --force-reinstall /tmp/luci-app-watchplug_1.0.1-1_all.ipk
+```
+
+### Either way
 
 The package is architecture `all` (shell + JS only): no SDK, no cross-compilation, it installs on
-any OpenWrt target. `/etc/config/watchplug` is declared as a conffile, so reinstalling never wipes
-your settings.
+any OpenWrt target. It depends only on `luci-base` and `jshn`, both present on a stock install.
+`/etc/config/watchplug` is declared as a conffile, so reinstalling or upgrading never wipes your
+settings.
 
 The page shows up under **Services → Watchplug**, with four tabs: *General* (status and manual
 buttons), *Settings* (monitoring), *Devices* (the controlled device) and *Logs*.
