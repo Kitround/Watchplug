@@ -283,11 +283,12 @@ function button(label, style, handler) {
 	}, [ label ]);
 }
 
-// One row of buttons per device, so two plugs are never driven by accident. `sec` is
-// the uci section the daemon reported; passing it through scopes every command to
-// that one device, and omitting it means all of them.
-function deviceButtons(d, only) {
-	var sec = only ? (d.section || '') : '',
+// One block of buttons per device, so two plugs are never driven by accident. Every
+// command carries the uci section the daemon reported, which scopes it to that one
+// device. The button labels stay short because the heading above them names it; the
+// notifications spell the name out, since they outlive the click.
+function deviceButtons(d) {
+	var sec = d.section || '',
 	    name = d.name || _('this device');
 
 	return [
@@ -330,12 +331,17 @@ function renderActions(st) {
 
 	var out = [ E('div', { 'style': 'margin:.5em 0' }, buttons) ];
 
-	// With one device the buttons need no heading; with several, each row is labelled
-	// so nobody cuts power to the wrong thing.
+	// Each device gets its own titled block, separated from the checks above and from
+	// each other -- with a single device too. These buttons cut power to real hardware,
+	// so it must always be legible which one, not only once a second is added. The rule
+	// is a translucent grey so it reads on a light and a dark theme alike.
 	devs.forEach(function(d) {
-		out.push(E('div', { 'style': 'margin:.5em 0' },
-			(devs.length > 1 ? [ E('strong', { 'style': 'margin-right:.6em' }, [ d.name || _('unnamed') ]) ] : [])
-				.concat(deviceButtons(d, devs.length > 1))));
+		out.push(E('div', {
+			'style': 'margin-top:.9em; padding-top:.7em; border-top:1px solid rgba(128,128,128,.35)'
+		}, [
+			E('h4', { 'style': 'margin:0 0 .5em 0' }, [ d.name || _('Unnamed device') ]),
+			E('div', {}, deviceButtons(d))
+		]));
 	});
 
 	return E('div', { 'id': 'watchplug-actions' }, out);
