@@ -16,3 +16,14 @@ start_service() {
 service_triggers() {
 	procd_add_reload_trigger "watchplug"
 }
+
+# The daemon re-reads its configuration at the top of every loop, so a change needs
+# no restart to take effect -- it lands on the next check.
+#
+# Without this function rc.common turns reload into restart, and procd fires one on
+# every save in LuCI. That is actively harmful here: a restart in the middle of a
+# chained cycle kills the chain, and the devices queued behind the current one never
+# get their turn. Returning 0 leaves the running daemon alone.
+reload_service() {
+	return 0
+}

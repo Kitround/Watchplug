@@ -8,6 +8,12 @@
 # here globs on purpose.
 set -f
 
+# The activity log holds every URL this app calls and the state file every device
+# address. Passwords are struck out of both, but neither is anyone else's business:
+# root writes them and rpcd, also root, is what serves them to LuCI. Nothing here is
+# ever read by an unprivileged process, so nothing here needs to be world-readable.
+umask 077
+
 RUNDIR=${WATCHPLUG_RUN:-/var/run}   # overridable so a harness can drive the real loop
 STATE_FILE=$RUNDIR/watchplug.json
 CYCLES_FILE=$RUNDIR/watchplug.cycles
@@ -103,6 +109,21 @@ load_config() {
 	# backoff_max=0 would clamp every threshold to 0 and cycle on every tick
 	[ "$backoff_max" -ge 1 ] 2>/dev/null || backoff_max=14400
 	[ "$enabled" = 1 ] || enabled=0
+
+	# Targets are pasted onto ping's command line as separate words, so anything that
+	# could pass for an option is dropped rather than trusted: a hand-edited "-f"
+	# would turn every check into a flood ping, as root. Only the characters an IPv4
+	# or IPv6 literal is made of get through, which is also the app's own rule --
+	# targets are addresses, never names, because a DNS failure is not a link failure.
+	_clean=
+	for _t in $targets; do
+		case "$_t" in
+		'' | -* | *[!0-9.:abcdefABCDEF]*) continue ;;
+		esac
+		_clean="$_clean $_t"
+	done
+	targets=${_clean# }
+	[ -n "$targets" ] || targets='1.1.1.1 9.9.9.9 8.8.8.8'
 }
 
 # The configured devices, as uci section names. Anonymous "config device" sections
@@ -196,7 +217,14 @@ json_field() {
 	echo "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' | head -n1
 }
 
-esc() { printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '; }
+# Makes a value safe to drop between two quotes in the state file. JSON forbids raw
+# control characters in a string, and a device reply or a name typed with a tab in it
+# would otherwise produce a file the page cannot parse -- which blanks the whole tab.
+# Newline and tab become spaces, the rest of the C0 range and DEL are dropped, and
+# everything from 0x80 up is left alone so a name in UTF-8 survives.
+esc() {
+	printf '%s' "$1" | tr -d '"\\' | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037\177'
+}
 
 # hms <seconds> : compact, readable durations for the log
 hms() {
@@ -386,7 +414,10 @@ poll_device() {
 		# out as an empty field and read exactly like an unplugged device, which
 		# sends the user hunting the network instead of the credentials.
 		if [ -n "$_pr" ] && ! reply_ok "$_pr"; then
-			plug_err="rejected the state query: $_pr"
+			# Through mask() like everything else that quotes a device back at the
+			# user: this string reaches the activity log and the status page, and a
+			# device is free to echo whatever it was sent back at us.
+			plug_err="rejected the state query: $(mask "$_pr")"
 			# Once per transition, not once per tick -- and per device, since one
 			# misconfigured plug must not silence the warning for the others. sh has
 			# no arrays, so the sections already warned about are kept in a string.
@@ -783,6 +814,14 @@ selftest() {
 	reply_ok '' && r=ok || r=fail
 	assert_eq "$r" fail "an empty reply counts as a failure"
 
+	# JSON forbids raw control characters in a string; a value carrying one would
+	# produce a state file the page cannot parse. Bytes from 0x80 up must survive, or
+	# a device named in anything but ASCII comes out mangled.
+	assert_eq "$(esc "$(printf 'a\tb')")" "a b" "a tab cannot reach the state JSON"
+	assert_eq "$(esc "$(printf 'a\007b')")" "ab" "control characters are dropped"
+	assert_eq "$(esc 'a"b\c')" "abc" "quotes and backslashes are dropped"
+	assert_eq "$(esc 'Prise é')" "Prise é" "UTF-8 survives untouched"
+
 	assert_eq "$(hms 45)" 45s "seconds"
 	assert_eq "$(hms 90)" 1m30s "minutes and seconds"
 	assert_eq "$(hms 5400)" 1h30m "hours and minutes"
@@ -829,6 +868,15 @@ selftest() {
 	assert_eq "$ping_count" 2 "non-numeric ping_count cannot make every check fail"
 	assert_eq "$ping_timeout" 3 "ping timeout never reaches 0"
 	assert_eq "$backoff_max" 14400 "backoff ceiling never reaches 0"
+
+	# ping takes its target as a bare word: anything option-shaped has to be gone
+	# before it gets there, or a hand-edited config turns checks into a flood ping.
+	uci() { case "$3" in *.targets) echo '-f 1.1.1.1 ; reboot 9.9.9.9 2001:db8::1' ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$targets" "1.1.1.1 9.9.9.9 2001:db8::1" "option-shaped and non-address targets are dropped"
+	uci() { case "$3" in *.targets) echo '-f' ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$targets" "1.1.1.1 9.9.9.9 8.8.8.8" "dropping every target falls back to the defaults"
 
 	# the Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL
 	uci() { case "$3" in *.off_time) echo 10m ;; *.preset) echo tasmota ;; *) return 1 ;; esac; }

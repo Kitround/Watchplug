@@ -213,6 +213,22 @@ so a chatty device cannot fill the router's RAM.
 *Clear log* empties it. The *Reset* button at the bottom of the page is LuCI's own — it reverts
 unsaved changes in the settings form and has nothing to do with the log.
 
+## Security notes
+
+- **Device passwords never reach the activity log.** Both the `password=` parameter and the
+  configured value itself are struck out, raw and percent-encoded, wherever they land — a custom
+  URL can carry the secret under any parameter name, or in `http://user:pass@host/`.
+- **The log and the state file are `0600`**, written and read only by root. LuCI reads them through
+  rpcd, which is also root.
+- **The device password is stored in plain text in `/etc/config/watchplug`**, as every OpenWrt
+  credential is. LuCI's ACL granularity is per config file, so anyone you grant read access to
+  Watchplug can read that password through the UCI API — the same is true of a wifi key. Give the
+  device a dedicated password, and prefer a plug on an isolated VLAN.
+- **Ping targets are filtered before reaching `ping`.** Anything option-shaped is dropped: a
+  hand-edited `-f` would otherwise turn every check into a flood ping, as root.
+- **The ubus device argument is validated** against a uci section-name shape, so a caller holding
+  the write ACL cannot aim config reads elsewhere.
+
 ## Device prerequisites
 
 - A static address (DHCP reservation) reachable from the router — including across VLANs or a

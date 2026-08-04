@@ -1,5 +1,10 @@
 #!/bin/sh
 # ubus backend for the Watchplug LuCI view -- every method delegates to /usr/sbin/watchplug.
+
+# Section names look like @device[0] and the brackets are a glob character class.
+# Nothing here is meant to match a filename, so pathname expansion is switched off.
+set -f
+
 . /usr/share/libubox/jshn.sh
 
 BIN=/usr/sbin/watchplug
@@ -95,21 +100,21 @@ call)
 			reply 0 "invalid device"
 		else
 			case "$state" in
-			on | off) run $BIN power "$state" $device ;;
+			on | off) run $BIN power "$state" "$device" ;;
 			*) reply 0 "invalid state" ;;
 			esac
 		fi
 		;;
 	cycle)
 		if read_device; then
-			run $BIN cycle $device
+			run $BIN cycle "$device"
 		else
 			reply 0 "invalid device"
 		fi
 		;;
 	fix_poweronstate)
 		if read_device; then
-			run $BIN fix-poweronstate $device
+			run $BIN fix-poweronstate "$device"
 		else
 			reply 0 "invalid device"
 		fi
