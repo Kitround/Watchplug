@@ -173,39 +173,15 @@ function renderStatus(st) {
 
 	var devs = devices(st);
 
+	// Each device's own state is rendered inside its block of buttons, right above
+	// them, so what a button is about to act on is readable without looking away.
+	// Only what concerns them collectively belongs in this table.
 	if (!devs.length)
 		rows.push(row(_('Devices'), warn(_('none configured'))));
 	else if (devs.length > 1)
 		rows.push(row(_('Cycle order'), st.device_mode == 'chain'
 			? _('one after another, %s apart').format(duration(st.device_delay))
 			: _('all at the same time')));
-
-	devs.forEach(function(d) {
-		var label = d.name || _('unnamed'),
-		    parts = [];
-
-		if (d.enabled != 1)
-			parts.push(_('not cycled'));
-
-		// A device that answers but rejects the query is a wrong relay name or wrong
-		// credentials — never let that read as "unreachable", which sends people
-		// looking at the network instead of at this form.
-		if (!d.configured)
-			rows.push(row(label, warn(_('not configured'))));
-		else if (d.error)
-			rows.push(row(label, warn('%s — %s'.format(d.preset || '?', d.error))));
-		else {
-			parts.unshift(d.power && d.power != '?'
-				? d.power : _('unreachable or state unknown'));
-			if (d.off_time)
-				parts.push(_('off %s per cycle').format(duration(d.off_time)));
-			rows.push(row(label, '%s — %s'.format(d.preset || '?', parts.join(' · '))));
-		}
-
-		if (d.poweronstate && d.poweronstate != '?' && d.poweronstate != '1')
-			rows.push(row('%s — PowerOnState'.format(label), warn(
-				_('%s — it will not switch back on by itself after a mains outage.').format(d.poweronstate))));
-	});
 
 	if (st.message)
 		rows.push(row(_('Info'), st.message));
@@ -287,6 +263,26 @@ function button(label, style, handler) {
 // command carries the uci section the daemon reported, which scopes it to that one
 // device. The button labels stay short because the heading above them names it; the
 // notifications spell the name out, since they outlive the click.
+// The one-line state shown above a device's buttons. A device that answers but
+// rejects the query is a wrong relay name or wrong credentials — never let that read
+// as "unreachable", which sends people looking at the network instead of at the form.
+function deviceState(d) {
+	if (!d.configured)
+		return warn(_('not configured'));
+
+	if (d.error)
+		return warn('%s — %s'.format(d.preset || '?', d.error));
+
+	var parts = [ (d.power && d.power != '?') ? d.power : _('unreachable or state unknown') ];
+
+	if (d.off_time)
+		parts.push(_('off %s per cycle').format(duration(d.off_time)));
+	if (d.enabled != 1)
+		parts.push(_('not cycled automatically'));
+
+	return '%s — %s'.format(d.preset || '?', parts.join(' · '));
+}
+
 function deviceButtons(d) {
 	var sec = d.section || '',
 	    name = d.name || _('this device');
@@ -311,7 +307,9 @@ function deviceButtons(d) {
 }
 
 function renderActions(st) {
-	var devs = devices(st).filter(function(d) { return d.configured; }),
+	// Unconfigured devices keep their block: it is where "not configured" is said, and
+	// dropping them would make a half-filled device look like it had been deleted.
+	var devs = devices(st),
 	    buttons = [
 		button(_('Check now'), 'action', function() {
 			return callCheck().then(function(res) {
@@ -333,15 +331,25 @@ function renderActions(st) {
 
 	// Each device gets its own titled block, separated from the checks above and from
 	// each other -- with a single device too. These buttons cut power to real hardware,
-	// so it must always be legible which one, not only once a second is added. The rule
-	// is a translucent grey so it reads on a light and a dark theme alike.
+	// so it must always be legible which one, and in what state, not only once a second
+	// device is added. The rule is a translucent grey so it reads on a light and a dark
+	// theme alike.
 	devs.forEach(function(d) {
+		var block = [
+			E('h4', { 'style': 'margin:0 0 .3em 0' }, [ d.name || _('Unnamed device') ]),
+			E('div', { 'style': 'margin:0 0 .6em 0' }, [ deviceState(d) ])
+		];
+
+		if (d.configured)
+			block.push(E('div', {}, deviceButtons(d)));
+
+		if (d.poweronstate && d.poweronstate != '?' && d.poweronstate != '1')
+			block.push(E('div', { 'style': 'margin-top:.6em' }, [ warn(
+				_('PowerOnState is %s — it will not switch back on by itself after a mains outage.').format(d.poweronstate)) ]));
+
 		out.push(E('div', {
-			'style': 'margin-top:.9em; padding-top:.7em; border-top:1px solid rgba(128,128,128,.35)'
-		}, [
-			E('h4', { 'style': 'margin:0 0 .5em 0' }, [ d.name || _('Unnamed device') ]),
-			E('div', {}, deviceButtons(d))
-		]));
+			'style': 'margin-top:.9em; padding:.7em 0 1.1em 0; border-top:1px solid rgba(128,128,128,.35)'
+		}, block));
 	});
 
 	return E('div', { 'id': 'watchplug-actions' }, out);
