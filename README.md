@@ -10,23 +10,12 @@ any HTTP device.
 
 ## Compatibility
 
-Built against **OpenWrt 21.02** and verified there. The package is architecture `all` — pure shell
-and JavaScript, nothing compiled — so it installs on any target, from an ath79 router to x86, with
-no SDK and no cross-compilation. It pulls in nothing: `luci-base` and `jshn` are both on a stock
-image.
+Verified on **OpenWrt 21.02**. Architecture `all` — pure shell and JavaScript, nothing compiled —
+so it installs on any target, and it needs only `luci-base` and `jshn`, both on a stock image.
 
-Later opkg-based releases — 22.03, 23.05, 24.10 — should work unchanged. The app only uses the
-client-side LuCI JS API (`view`, `form`, `rpc`, `poll`, `ui`, `tools.widgets`), the rpcd ACL
-format, procd and netifd's `network_get_device`, none of which changed across those releases.
-That is reasoning from the API surface, not a tested claim — reports welcome.
-
-Two things put a release out of scope:
-
-- **Older than 21.02.** The UI is built on the client-side LuCI JS API, so a LuCI still rendering
-  server-side will not show the page at all.
-- **OpenWrt built around `apk` instead of `opkg`.** The `.ipk` here is the opkg container — a
-  gzipped tar holding `./debian-binary`, `./data.tar.gz` and `./control.tar.gz`. An apk-based
-  release cannot install it, and would need the package rebuilt in that format.
+Later opkg releases (22.03, 23.05, 24.10) should work unchanged, though they are untested. It will
+not work below 21.02, where LuCI still rendered server-side, nor on an `apk`-based OpenWrt, which
+cannot install an `.ipk`.
 
 ## Supported devices
 
