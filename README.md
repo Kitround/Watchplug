@@ -28,12 +28,41 @@ ath79 router to x86.
 Below 21.02 it will not work at all: the UI is built on the client-side LuCI JS API, and an older
 LuCI renders its pages server-side.
 
-## Supported devices
+## Devices
+
+Add as many as you need on the *Devices* tab. Each one carries its own address, credentials,
+device type and off time, plus a name that labels it on the status page, on its own set of buttons
+and in the log.
+
+### Device types
 
 - **Tasmota** (built-in preset): address, relay and optional credentials, nothing else to fill in.
 - **Anything else with an HTTP API**: give it switch-on / switch-off / cycle / state URLs, with
   `{host} {port} {user} {password} {off_time} {off_ds}` placeholders. Shelly native, relay boards,
   a home-automation hub endpoint, your own CGI script.
+
+The address field offers the hosts the router already knows — DHCP leases and neighbours — and
+still accepts anything typed in, which is what a plug on a static address outside the lease file
+needs.
+
+### When there is more than one
+
+*Settings → With several devices* decides what an outage does:
+
+| Mode | Behaviour |
+|---|---|
+| `parallel` (default) | Every enabled device is cycled at the same time. |
+| `chain` | They are cycled in order, `device_delay` apart — for an ONT that has to be back before the router is cut. |
+
+Any device can be **left out of the automatic cycle without being deleted**: untick *Cycle this
+device* and it stays visible on the status page and drivable by its own buttons. That is what you
+want while wiring a second plug up, or when one of them is the router's own supply.
+
+The 24 h cap and the progressive spacing stay **global**. They count outages, not hardware, so two
+plugs still add up to one cycle.
+
+A device that is unreachable does not cancel the others: the cycle counts as done as long as one
+device took its command, since the point is to get the link back.
 
 ## What sets it apart from a cron job and a curl call
 
@@ -49,10 +78,7 @@ LuCI renders its pages server-side.
   the link is down. Two independent switches change that — spacing out repeated attempts
   (doubling, 20 min, 40, 80…) and a cap of N cycles per rolling 24 hours, which moves the app to a
   `blocked` state. Both off by default.
-- **Several devices**, each with its own address, credentials and off time. Cycle them together or
-  one after another with a wait between — an ONT that has to be back before the router is cut.
-  Any of them can be left out of the automatic cycle without being deleted, and each keeps its own
-  buttons.
+- **Several devices**, together or chained — see [Devices](#devices) above.
 - **Status stays live while disarmed**, so you can wire everything up and watch it before you let
   it act.
 
