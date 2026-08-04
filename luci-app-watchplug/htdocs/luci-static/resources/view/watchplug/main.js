@@ -4,6 +4,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require network';
 'require tools.widgets as widgets';
 
 var callStatus = rpc.declare({ object: 'luci.watchplug', method: 'status' });
@@ -90,6 +91,27 @@ function duration(s) {
 function stamp(ts) {
 	ts = parseInt(ts);
 	return (ts > 0) ? new Date(ts * 1000).toLocaleString() : '-';
+}
+
+// The hosts the router already knows -- DHCP leases and neighbours -- as [value, label]
+// pairs. getHostHints() keys them by MAC, while this app needs the address it will call,
+// so the addresses are pulled out and de-duplicated. The IPv4 list is 'ipaddrs' on newer
+// LuCI and 'ipv4' on 21.02; LuCI's own getMACHints reads both, so this does too.
+function hostChoices(hints) {
+	var hosts = (hints && hints.hosts) ? hints.hosts : {},
+	    seen = {}, out = [];
+
+	Object.keys(hosts).forEach(function(mac) {
+		var h = hosts[mac] || {};
+		L.toArray(h.ipaddrs || h.ipv4).forEach(function(ip) {
+			if (!ip || seen[ip])
+				return;
+			seen[ip] = true;
+			out.push([ ip, h.name ? '%s (%s)'.format(h.name, ip) : ip ]);
+		});
+	});
+
+	return out.sort(function(a, b) { return a[1].localeCompare(b[1]); });
 }
 
 function row(label, value) {
@@ -279,12 +301,13 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callStatus(), {}),
-			L.resolveDefault(callLogs(), {})
+			L.resolveDefault(callLogs(), {}),
+			L.resolveDefault(network.getHostHints(), null)
 		]);
 	},
 
 	render: function(data) {
-		var st = data[0], logs = data[1], m, s, o;
+		var st = data[0], logs = data[1], hints = data[2], m, s, o;
 
 		m = new form.Map('watchplug', _('Watchplug'),
 			_('Watches connectivity on a router interface and drives an HTTP-controlled device when it stays down.'));
@@ -361,9 +384,12 @@ return view.extend({
 		o.default = 'tasmota';
 
 		o = s.option(form.Value, 'host', _('Device address'),
-			_('Used by the Tasmota preset, and available as <code>{host}</code> in custom URLs.'));
+			_('Pick a host the router already knows, or type an address. Used by the Tasmota preset, and available as <code>{host}</code> in custom URLs.'));
 		o.datatype = 'host';
 		o.placeholder = '192.168.x.x';
+		// Adding choices turns the field into a Combobox, which forces create=true --
+		// a device on a static address, outside any DHCP lease, stays typeable.
+		hostChoices(hints).forEach(function(c) { o.value(c[0], c[1]); });
 
 		o = s.option(form.Value, 'port', _('HTTP port'));
 		o.datatype = 'port';
