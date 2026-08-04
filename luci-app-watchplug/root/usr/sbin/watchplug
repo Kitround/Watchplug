@@ -2,6 +2,12 @@
 # Watchplug -- drive an HTTP-controlled device from the connectivity state of a router interface.
 # Single implementation: the procd daemon, the CLI and the rpcd backend all call into here.
 
+# uci names anonymous sections @device[0], and the brackets are a glob character
+# class. Every list of sections is walked through an unquoted expansion, so pathname
+# expansion is switched off rather than quoted around one word at a time. Nothing
+# here globs on purpose.
+set -f
+
 RUNDIR=${WATCHPLUG_RUN:-/var/run}   # overridable so a harness can drive the real loop
 STATE_FILE=$RUNDIR/watchplug.json
 CYCLES_FILE=$RUNDIR/watchplug.cycles
@@ -75,26 +81,13 @@ load_config() {
 	[ "$limit_cycles" = 1 ] || limit_cycles=0
 	[ "$backoff" = 1 ] || backoff=0
 
-	preset=$(cfg plug preset tasmota)
-	plug_host=$(cfg plug host '')
-	plug_port=$(cfg plug port 80)
-	relay=$(cfg plug relay Power)
-	plug_user=$(cfg plug user '')
-	plug_password=$(cfg plug password '')
-	off_time=$(secs "$(cfg plug off_time 30s)")
-	http_timeout=$(secs "$(cfg plug http_timeout 5s)")
-	enforce_pos=$(cfg plug enforce_poweronstate 1)
+	# parallel: every enabled device is cycled at once. chain: one after another,
+	# device_delay apart, for a string of equipment that has to come back in order.
+	device_mode=$(cfg main device_mode parallel)
+	device_delay=$(secs "$(cfg main device_delay 30s)")
+	[ "$device_mode" = chain ] || device_mode=parallel
+	[ "$device_delay" -ge 0 ] 2>/dev/null || device_delay=30
 
-	url_on=$(cfg plug url_on '')
-	url_off=$(cfg plug url_off '')
-	url_cycle=$(cfg plug url_cycle '')
-	url_state=$(cfg plug url_state '')
-	state_key=$(cfg plug state_key '')
-
-	# The Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL.
-	[ "$preset" = tasmota ] && [ "$off_time" -gt "$TASMOTA_MAX_DELAY" ] 2>/dev/null &&
-		off_time=$TASMOTA_MAX_DELAY
-	[ "$off_time" -lt 1 ] 2>/dev/null && off_time=1
 	# /etc/config/watchplug is a conffile: it survives upgrades and gets hand-edited,
 	# so every value reaching a loop, a ping argument or the state JSON is checked here.
 	# An empty or non-numeric interval would turn the daemon loop into a busy loop; a
@@ -109,8 +102,55 @@ load_config() {
 	[ "$max_cycles" -ge 1 ] 2>/dev/null || max_cycles=3
 	# backoff_max=0 would clamp every threshold to 0 and cycle on every tick
 	[ "$backoff_max" -ge 1 ] 2>/dev/null || backoff_max=14400
-	[ "$http_timeout" -ge 1 ] 2>/dev/null || http_timeout=5
 	[ "$enabled" = 1 ] || enabled=0
+}
+
+# The configured devices, as uci section names. Anonymous "config device" sections
+# answer to @device[n], so they can be walked without parsing `uci show`.
+#
+# A config written before multiple devices existed holds one "config plug 'plug'"
+# section, and /etc/config/watchplug is a conffile, so it survives every upgrade.
+# It is reported as a device here too: the daemon keeps driving an un-migrated
+# install exactly as before.
+list_devices() {
+	_i=0
+	while uci -q get "watchplug.@device[$_i]" >/dev/null 2>&1; do
+		echo "@device[$_i]"
+		_i=$((_i + 1))
+	done
+	[ "$_i" = 0 ] && uci -q get watchplug.plug >/dev/null 2>&1 && echo plug
+	return 0
+}
+
+# Populates the device globals from one section. Every function that talks to a
+# device -- tasmota(), expand_url(), device_power(), do_cycle() -- reads these, so
+# they operate on whichever device was loaded last.
+load_device() { # load_device <uci section>
+	dev_section=$1
+	dev_enabled=$(cfg "$1" enabled 1)
+	dev_name=$(cfg "$1" name '')
+	preset=$(cfg "$1" preset tasmota)
+	plug_host=$(cfg "$1" host '')
+	plug_port=$(cfg "$1" port 80)
+	relay=$(cfg "$1" relay Power)
+	plug_user=$(cfg "$1" user '')
+	plug_password=$(cfg "$1" password '')
+	off_time=$(secs "$(cfg "$1" off_time 30s)")
+	http_timeout=$(secs "$(cfg "$1" http_timeout 5s)")
+	enforce_pos=$(cfg "$1" enforce_poweronstate 1)
+
+	url_on=$(cfg "$1" url_on '')
+	url_off=$(cfg "$1" url_off '')
+	url_cycle=$(cfg "$1" url_cycle '')
+	url_state=$(cfg "$1" url_state '')
+	state_key=$(cfg "$1" state_key '')
+
+	[ "$dev_enabled" = 0 ] || dev_enabled=1
+	# The Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL.
+	[ "$preset" = tasmota ] && [ "$off_time" -gt "$TASMOTA_MAX_DELAY" ] 2>/dev/null &&
+		off_time=$TASMOTA_MAX_DELAY
+	[ "$off_time" -lt 1 ] 2>/dev/null && off_time=1
+	[ "$http_timeout" -ge 1 ] 2>/dev/null || http_timeout=5
 }
 
 # --- pure helpers (no network, no uci -- covered by `watchplug selftest`) -----
@@ -293,11 +333,16 @@ device_configured() {
 	esac
 }
 
+# The name given in LuCI wins: with several devices, "ONT" beats an address nobody
+# remembers. Falls back to the address, then to a constant for a bare custom URL.
 device_label() {
-	case "$preset" in
-	tasmota) echo "$plug_host" ;;
-	*) [ -n "$plug_host" ] && echo "$plug_host" || echo "custom URL" ;;
-	esac
+	if [ -n "$dev_name" ]; then
+		echo "$dev_name"
+	elif [ -n "$plug_host" ]; then
+		echo "$plug_host"
+	else
+		echo "custom URL"
+	fi
 }
 
 device_power() { # device_power on|off
@@ -342,14 +387,26 @@ poll_device() {
 		# sends the user hunting the network instead of the credentials.
 		if [ -n "$_pr" ] && ! reply_ok "$_pr"; then
 			plug_err="rejected the state query: $_pr"
-			# once per transition, not once per tick
-			[ "$poll_warned" = 1 ] ||
+			# Once per transition, not once per tick -- and per device, since one
+			# misconfigured plug must not silence the warning for the others. sh has
+			# no arrays, so the sections already warned about are kept in a string.
+			case " $warned_devices " in
+			*" $dev_section "*) ;;
+			*)
 				log warn "device $(device_label) $plug_err -- check the relay name and, if Tasmota web authentication is on, the credentials"
-			poll_warned=1
+				warned_devices="$warned_devices $dev_section"
+				;;
+			esac
 			http_quiet=0
 			return 0
 		fi
-		poll_warned=0
+		# Section names look like @device[0]: brackets are sed and glob metacharacters,
+		# so the entry is cut out with quoted parameter expansion, which matches literally.
+		case " $warned_devices " in
+		*" $dev_section "*)
+			warned_devices="${warned_devices%%"$dev_section"*}${warned_devices#*"$dev_section"}"
+			;;
+		esac
 		plug_power=$(json_field "$_pr" "$(upper "$relay")")
 		plug_pos=$(json_field "$(tasmota PowerOnState)" PowerOnState)
 		[ -n "$plug_pos" ] || plug_pos='?'
@@ -412,12 +469,81 @@ do_cycle() {
 	return 0
 }
 
+# Cycles every enabled device. Succeeds if at least one did: with two plugs, one
+# unreachable must not cancel the cycle of the other, since the point is to get the
+# link back. The caller records a single cycle whatever the device count -- the cap
+# and the backoff count outages, not hardware.
+#
+# chain waits device_delay between devices, for equipment that has to come back in
+# order. The wait is deliberately blocking: the next tick is not due for a whole
+# interval, and a backgrounded chain would race the next one.
+cycle_all() {
+	_ok=0
+	_first=1
+	for _s in $(list_devices); do
+		load_device "$_s"
+		[ "$dev_enabled" = 1 ] || continue
+		device_configured || continue
+
+		if [ "$device_mode" = chain ] && [ "$_first" = 0 ] && [ "$device_delay" -gt 0 ]; then
+			log info "waiting ${device_delay}s before the next device in the chain"
+			sleep "$device_delay"
+		fi
+		_first=0
+
+		do_cycle && _ok=1
+	done
+
+	[ "$_ok" = 1 ] && return 0
+	log err "no device could be cycled"
+	return 1
+}
+
 record_cycle() { # record_cycle <now>
 	_kept=$(prune_cycles "$1" "$WINDOW" $(cat "$CYCLES_FILE" 2>/dev/null))
 	echo "$_kept $1" >"$CYCLES_FILE"
 }
 
 # --- state --------------------------------------------------------------------
+
+# Polls every configured device and builds both the JSON array the page reads and
+# the tail of the activity line. Disabled devices are polled too: "enabled" governs
+# whether a device gets cycled, not whether its state is worth showing -- a status
+# page that goes blank when you disarm something reads as broken hardware.
+poll_all() {
+	devices_json=""
+	devices_sum=""
+	device_count=0
+
+	for _ds in $(list_devices); do
+		load_device "$_ds"
+		poll_device
+		device_count=$((device_count + 1))
+
+		if device_configured; then
+			_conf=true
+			devices_sum="$devices_sum | $(device_label)=$plug_power"
+		else
+			_conf=false
+		fi
+		[ -n "$plug_err" ] && devices_sum="$devices_sum ($plug_err)"
+
+		[ -n "$devices_json" ] && devices_json="$devices_json,"
+		devices_json="$devices_json
+		{
+			\"section\": \"$(esc "$dev_section")\",
+			\"name\": \"$(esc "$(device_label)")\",
+			\"enabled\": $dev_enabled,
+			\"configured\": $_conf,
+			\"preset\": \"$(esc "$preset")\",
+			\"host\": \"$(esc "$plug_host")\",
+			\"off_time\": $off_time,
+			\"power\": \"$(esc "$plug_power")\",
+			\"poweronstate\": \"$(esc "$plug_pos")\",
+			\"error\": \"$(esc "$plug_err")\"
+		}"
+	done
+}
 
 write_state() {
 	down_for=0
@@ -438,8 +564,7 @@ write_state() {
 	blocked) sum="$sum | BLOCKED, $cycles_24h/$max_cycles cycles used" ;;
 	disabled) sum="$sum | monitoring disarmed, no action" ;;
 	esac
-	device_configured && sum="$sum | device $(device_label)=$plug_power"
-	[ -n "$plug_err" ] && sum="$sum | $plug_err"
+	sum="$sum$devices_sum"
 	[ -n "$message" ] && sum="$sum | $message"
 	act "$sum -> state $state"
 
@@ -464,12 +589,11 @@ write_state() {
 	"limit_cycles": $limit_cycles,
 	"cycles_24h": $cycles_24h,
 	"max_cycles": $max_cycles,
-	"off_time": $off_time,
-	"preset": "$(esc "$preset")",
-	"device": "$(esc "$(device_label)")",
-	"device_power": "$(esc "$plug_power")",
-	"poweronstate": "$(esc "$plug_pos")",
-	"device_error": "$(esc "$plug_err")",
+	"device_mode": "$device_mode",
+	"device_delay": $device_delay,
+	"device_count": $device_count,
+	"devices": [$devices_json
+	],
 	"message": "$(esc "$message")"
 }
 EOF
@@ -506,9 +630,9 @@ tick() {
 		log info "rearmed from the web interface"
 	fi
 
-	# Poll before the enabled check: the status page must show the real device and
+	# Poll before the enabled check: the status page must show the real devices and
 	# link state even while monitoring is disarmed. check_conn sets wan_device.
-	poll_device
+	poll_all
 	if check_conn; then online=true; else online=false; fi
 
 	if [ "$enabled" != 1 ]; then
@@ -549,15 +673,20 @@ tick() {
 		state=blocked
 		message="cap of $max_cycles cycles per 24h reached"
 	elif [ $((now - since)) -ge "$thr" ]; then
-		if do_cycle; then
+		# One cycle is recorded whatever the device count: the cap and the backoff
+		# are counting outages, not hardware.
+		if cycle_all; then
 			last_cycle=$now
 			since=$now
 			record_cycle "$now"
 			cycles_24h=$((cycles_24h + 1))
 			cooldown_until=$((now + recovery_grace))
 			state=cooldown
+			# A chain can have slept through several device delays; re-poll so the
+			# page does not show pre-cycle states until the next tick.
+			poll_all
 		else
-			message="device unreachable"
+			message="no device could be cycled"
 		fi
 	fi
 	write_state
@@ -579,7 +708,10 @@ daemon() {
 	plug_power='?'
 	plug_pos='?'
 	plug_err=''
-	poll_warned=0
+	warned_devices=''
+	devices_json=''
+	devices_sum=''
+	device_count=0
 	http_quiet=0
 	log info "daemon starting"
 	while :; do
@@ -678,11 +810,41 @@ selftest() {
 
 	# the Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL
 	uci() { case "$3" in *.off_time) echo 10m ;; *.preset) echo tasmota ;; *) return 1 ;; esac; }
-	load_config
+	load_device plug
 	assert_eq "$off_time" 360 "Tasmota off time clamped to the Delay ceiling"
 	uci() { case "$3" in *.off_time) echo 10m ;; *.preset) echo custom ;; *) return 1 ;; esac; }
-	load_config
+	load_device plug
 	assert_eq "$off_time" 600 "custom preset keeps its own off time"
+
+	# A device is enabled unless it says otherwise: a section written before the flag
+	# existed must not silently stop being cycled.
+	uci() { return 1; }
+	load_device plug
+	assert_eq "$dev_enabled" 1 "a device with no enabled option counts as enabled"
+	uci() { case "$3" in *.enabled) echo 0 ;; *) return 1 ;; esac; }
+	load_device plug
+	assert_eq "$dev_enabled" 0 "a device can be switched off without being deleted"
+
+	uci() { case "$3" in *.device_mode) echo nonsense ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$device_mode" parallel "an unknown cycle mode falls back to parallel"
+	uci() { case "$3" in *.device_mode) echo chain ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$device_mode" chain "chain mode is accepted"
+
+	uci() { case "$3" in 'watchplug.@device[0]' | 'watchplug.@device[1]') echo device ;; *) return 1 ;; esac; }
+	assert_eq "$(list_devices | tr '\n' ' ')" '@device[0] @device[1] ' "anonymous device sections are walked"
+	uci() { case "$3" in watchplug.plug) echo plug ;; *) return 1 ;; esac; }
+	assert_eq "$(list_devices)" plug "a pre-multi-device config still yields its plug"
+	uci() { return 1; }
+	assert_eq "$(list_devices)" "" "no devices configured is not an error"
+
+	dev_name=ONT plug_host=10.0.0.5 preset=tasmota
+	assert_eq "$(device_label)" ONT "the given name labels the device"
+	dev_name=
+	assert_eq "$(device_label)" 10.0.0.5 "without a name, the address"
+	plug_host= preset=custom
+	assert_eq "$(device_label)" "custom URL" "without either, a constant"
 
 	echo "selftest OK"
 }
@@ -696,11 +858,15 @@ usage: watchplug <command>
   status              last known state, as JSON
   logs [n]            last n activity lines (default 200)
   clear-logs          empty the activity log
-  power on|off        drive the controlled device
-  cycle               manual off/on cycle
+  power on|off [dev]  drive a device, or every configured one
+  cycle [dev]         manual off/on cycle, one device or all of them
   rearm               clear the cycle history (unblocks the 24h cap)
-  fix-poweronstate    force PowerOnState=1 (Tasmota preset only)
+  fix-poweronstate [dev]  force PowerOnState=1 (Tasmota preset only)
+  devices             list the configured devices
   selftest            check the duration / threshold / URL helpers
+
+[dev] is a uci section, as printed by "watchplug devices" -- @device[0] and so on.
+Omitted, the command applies to every configured device.
 EOF
 }
 
@@ -729,24 +895,42 @@ clear-logs)
 	act "[info ] activity log cleared"
 	echo "activity log cleared"
 	;;
+devices)
+	for s in $(list_devices); do
+		load_device "$s"
+		printf '%s\t%s\t%s\t%s\n' "$s" "$(device_label)" "$preset" \
+			"$([ "$dev_enabled" = 1 ] && echo enabled || echo disabled)"
+	done
+	;;
 power)
 	load_config
 	case "$2" in
-	on | off)
-		log info "manual switch $2 requested"
-		device_power "$2"
-		;;
+	on | off) ;;
 	*)
-		echo "usage: watchplug power on|off" >&2
+		echo "usage: watchplug power on|off [device]" >&2
 		exit 1
 		;;
 	esac
+	log info "manual switch $2 requested${3:+ for $3}"
+	rc=1
+	for s in ${3:-$(list_devices)}; do
+		load_device "$s"
+		device_configured || continue
+		device_power "$2" && rc=0
+	done
+	[ "$rc" = 0 ] || echo "no device could be switched $2" >&2
+	exit $rc
 	;;
 cycle)
 	load_config
 	cycle_ts=$(date +%s)
-	log info "manual cycle requested"
-	do_cycle || exit 1
+	log info "manual cycle requested${2:+ for $2}"
+	if [ -n "$2" ]; then
+		load_device "$2"
+		do_cycle || exit 1
+	else
+		cycle_all || exit 1
+	fi
 	record_cycle "$cycle_ts"
 	;;
 rearm)
@@ -757,11 +941,15 @@ rearm)
 	;;
 fix-poweronstate)
 	load_config
-	[ "$preset" = tasmota ] || {
-		echo "PowerOnState is a Tasmota feature, current preset is '$preset'" >&2
-		exit 1
-	}
-	tasmota "PowerOnState 1"
+	rc=1
+	for s in ${2:-$(list_devices)}; do
+		load_device "$s"
+		[ "$preset" = tasmota ] || continue
+		device_configured || continue
+		tasmota "PowerOnState 1" && rc=0
+	done
+	[ "$rc" = 0 ] || echo "PowerOnState is a Tasmota feature, no Tasmota device to fix" >&2
+	exit $rc
 	;;
 selftest) selftest ;;
 *)

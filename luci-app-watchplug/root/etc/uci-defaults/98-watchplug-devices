@@ -1,0 +1,35 @@
+#!/bin/sh
+# Converts a config written before Watchplug drove several devices.
+#
+# Such a config holds a single "config plug 'plug'" section, and
+# /etc/config/watchplug is a conffile, so that file survives every upgrade
+# untouched. This turns it into a "config device" section so the settings show up on
+# the Devices tab instead of looking lost.
+#
+# Run by default_postinst, which deletes the script once it exits 0, so it cannot run
+# twice. It is sourced in a subshell, so exiting here does not abort the install.
+#
+# The daemon reports a leftover 'plug' section as a device on its own, so an install
+# where this never ran keeps being driven correctly -- this is about the interface.
+
+uci -q get watchplug.plug >/dev/null 2>&1 || exit 0
+uci -q get "watchplug.@device[0]" >/dev/null 2>&1 && exit 0
+
+sec=$(uci add watchplug device) || exit 1
+
+for opt in preset host port relay user password off_time http_timeout \
+	enforce_poweronstate url_on url_off url_cycle url_state state_key; do
+	val=$(uci -q get "watchplug.plug.$opt") || continue
+	[ -n "$val" ] || continue
+	uci set "watchplug.$sec.$opt=$val"
+done
+
+# The flag did not exist before, and its absence must not read as "do not cycle".
+uci set "watchplug.$sec.enabled=1"
+
+uci delete watchplug.plug
+uci commit watchplug
+
+logger -t watchplug -p daemon.info "migrated the configured device to the multi-device layout"
+
+exit 0

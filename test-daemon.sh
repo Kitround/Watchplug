@@ -31,21 +31,23 @@ watchplug.main.backoff=0
 watchplug.main.backoff_max=8s
 watchplug.main.limit_cycles=1
 watchplug.main.max_cycles=2
-watchplug.plug.host=192.0.2.9
-watchplug.plug.port=80
-watchplug.plug.relay=Power
-watchplug.plug.off_time=1
-watchplug.plug.http_timeout=1
-watchplug.plug.enforce_poweronstate=1
-watchplug.plug.user=admin
-watchplug.plug.password=s3cr3tpw
+watchplug.@device[0]=device
+watchplug.@device[0].name=plugA
+watchplug.@device[0].host=192.0.2.9
+watchplug.@device[0].port=80
+watchplug.@device[0].relay=Power
+watchplug.@device[0].off_time=1
+watchplug.@device[0].http_timeout=1
+watchplug.@device[0].enforce_poweronstate=1
+watchplug.@device[0].user=admin
+watchplug.@device[0].password=s3cr3tpw
 EOF
 
+# Exact key match, not a grep anchor: section names look like @device[0] and the
+# brackets would be read as a character class.
 cat >"$tmp/bin/uci" <<EOF
 #!/bin/sh
-v=\$(grep "^\$3=" "$CFG" | head -1 | cut -d= -f2-)
-[ -n "\$v" ] || exit 1
-echo "\$v"
+awk -F= -v k="\$3" '\$1 == k { sub(/^[^=]*=/, ""); print; found = 1; exit } END { exit !found }' "$CFG"
 EOF
 
 cat >"$tmp/bin/ping" <<EOF
@@ -203,6 +205,61 @@ grep -q '\[error\].*refused the cycle command' "$LOG" || {
 	echo "FAIL: refusal not explained in the activity log" >&2; tail -3 "$LOG" >&2; exit 1; }
 echo "ok: refused command surfaces as an error"
 
+echo "# several devices: cycled together, chained, or left out"
+cat >"$tmp/bin/uclient-fetch" <<EOF
+#!/bin/sh
+for a in "\$@"; do url=\$a; done
+echo "\$(date +%s) \$url" >>"$FETCHLOG"
+case "\$url" in
+	*PowerOnState*) echo '{"PowerOnState":1}' ;;
+	*Backlog*)      echo '{"Backlog":"Done"}' ;;
+	*)              echo '{"POWER":"ON"}' ;;
+esac
+EOF
+chmod +x "$tmp/bin/uclient-fetch"
+cat >>"$CFG" <<'EOF'
+watchplug.@device[1]=device
+watchplug.@device[1].name=plugB
+watchplug.@device[1].host=192.0.2.11
+watchplug.@device[1].port=80
+watchplug.@device[1].relay=Power
+watchplug.@device[1].off_time=1
+watchplug.@device[1].http_timeout=1
+EOF
+[ "$("$BIN" devices | wc -l | tr -d ' ')" -eq 2 ] || {
+	echo "FAIL: both devices not listed" >&2; "$BIN" devices >&2; exit 1; }
+
+: >"$FETCHLOG"
+"$BIN" cycle >/dev/null || { echo "FAIL: cycling two devices failed" >&2; exit 1; }
+grep -q '192\.0\.2\.9.*Backlog' "$FETCHLOG" || {
+	echo "FAIL: first device not cycled" >&2; cat "$FETCHLOG" >&2; exit 1; }
+grep -q '192\.0\.2\.11.*Backlog' "$FETCHLOG" || {
+	echo "FAIL: second device not cycled" >&2; cat "$FETCHLOG" >&2; exit 1; }
+echo "ok: both devices cycled"
+
+echo "watchplug.@device[1].enabled=0" >>"$CFG"
+: >"$FETCHLOG"
+"$BIN" cycle >/dev/null || { echo "FAIL: cycle failed with one device disabled" >&2; exit 1; }
+grep -q '192\.0\.2\.11.*Backlog' "$FETCHLOG" && {
+	echo "FAIL: a disabled device was cycled anyway" >&2; exit 1; }
+grep -q '192\.0\.2\.9.*Backlog' "$FETCHLOG" || {
+	echo "FAIL: the enabled device was skipped too" >&2; exit 1; }
+echo "ok: a disabled device is left alone, the other still cycles"
+
+# grep -Fv, not sed: the key contains brackets
+grep -Fv 'watchplug.@device[1].enabled=0' "$CFG" >"$CFG.new" && mv "$CFG.new" "$CFG"
+printf 'watchplug.main.device_mode=chain\nwatchplug.main.device_delay=2\n' >>"$CFG"
+: >"$FETCHLOG"
+t0=$(date +%s)
+"$BIN" cycle >/dev/null || { echo "FAIL: chained cycle failed" >&2; exit 1; }
+gap=$(( $(date +%s) - t0 ))
+[ "$gap" -ge 2 ] || { echo "FAIL: chain mode did not wait between devices (${gap}s)" >&2; exit 1; }
+grep -q '192\.0\.2\.11.*Backlog' "$FETCHLOG" || {
+	echo "FAIL: chain stopped before the second device" >&2; exit 1; }
+echo "ok: chain mode waited ${gap}s before the second device"
+
+grep -Fv 'watchplug.main.device_mode=chain' "$CFG" >"$CFG.new" && mv "$CFG.new" "$CFG"
+
 echo "# custom preset: placeholders expanded, password never logged"
 cat >"$tmp/bin/uclient-fetch" <<EOF
 #!/bin/sh
@@ -212,8 +269,8 @@ echo OK
 EOF
 chmod +x "$tmp/bin/uclient-fetch"
 cat >>"$CFG" <<'EOF'
-watchplug.plug.preset=custom
-watchplug.plug.url_cycle=http://{host}:{port}/relay?off={off_time}&ds={off_ds}&pw={password}
+watchplug.@device[0].preset=custom
+watchplug.@device[0].url_cycle=http://{host}:{port}/relay?off={off_time}&ds={off_ds}&pw={password}
 EOF
 "$BIN" cycle >/dev/null || { echo "FAIL: custom cycle URL reported failure" >&2; exit 1; }
 grep -q 'relay?off=1&ds=10&pw=s3cr3tpw' "$FETCHLOG" || {
@@ -223,6 +280,28 @@ grep -q 's3cr3tpw' "$LOG" && {
 grep -q 'pw=\*\*\*' "$LOG" || {
 	echo "FAIL: custom URL not masked in the activity log" >&2; tail -3 "$LOG" >&2; exit 1; }
 echo "ok: custom preset expanded, password masked outside a 'password=' parameter"
+
+echo "# a config written before multiple devices is still driven"
+cat >"$tmp/bin/uclient-fetch" <<EOF
+#!/bin/sh
+for a in "\$@"; do url=\$a; done
+echo "\$(date +%s) \$url" >>"$FETCHLOG"
+echo '{"Backlog":"Done"}'
+EOF
+chmod +x "$tmp/bin/uclient-fetch"
+cat >"$CFG" <<'EOF'
+watchplug.plug=plug
+watchplug.plug.host=192.0.2.50
+watchplug.plug.relay=Power
+watchplug.plug.off_time=1
+EOF
+[ "$("$BIN" devices | cut -f1)" = plug ] || {
+	echo "FAIL: the legacy plug section is not reported as a device" >&2; "$BIN" devices >&2; exit 1; }
+: >"$FETCHLOG"
+"$BIN" cycle >/dev/null || { echo "FAIL: a legacy config could not be cycled" >&2; exit 1; }
+grep -q '192\.0\.2\.50.*Backlog' "$FETCHLOG" || {
+	echo "FAIL: the legacy plug was not cycled" >&2; cat "$FETCHLOG" >&2; exit 1; }
+echo "ok: an un-migrated config keeps being driven"
 
 echo "# clearing the log empties it and says so"
 "$BIN" clear-logs >/dev/null

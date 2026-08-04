@@ -17,6 +17,32 @@ run() {
 	[ $rc -eq 0 ] && reply 1 "$out" || reply 0 "$out"
 }
 
+# The device argument names a uci section and is reachable by anyone holding the
+# write ACL, so it is checked rather than trusted. It cannot inject a command --
+# the CLI only ever expands it inside quotes -- but an unchecked value would let a
+# caller aim uci reads at arbitrary paths under the watchplug config.
+# Empty means "every configured device", which is what the CLI does with no argument.
+device_arg() {
+	case "$1" in
+	'') return 0 ;;
+	@device\[*\] | [a-zA-Z_]*) : ;;
+	*) return 1 ;;
+	esac
+	case "$1" in
+	*[!a-zA-Z0-9_@\[\]]*) return 1 ;;
+	esac
+	return 0
+}
+
+# read_device <json input> : the optional "device" member, validated
+read_device() {
+	read -r input
+	json_load "$input" 2>/dev/null || return 1
+	json_get_var device device
+	json_get_var state state
+	device_arg "$device"
+}
+
 case "$1" in
 list)
 	json_init
@@ -30,12 +56,15 @@ list)
 	json_close_object
 	json_add_object power
 	json_add_string state ""
+	json_add_string device ""
 	json_close_object
 	json_add_object cycle
+	json_add_string device ""
 	json_close_object
 	json_add_object rearm
 	json_close_object
 	json_add_object fix_poweronstate
+	json_add_string device ""
 	json_close_object
 	json_dump
 	;;
@@ -62,18 +91,31 @@ call)
 		json_dump
 		;;
 	power)
-		read -r input
-		json_load "$input"
-		json_get_var state state
-		case "$state" in
-		on | off) run $BIN power "$state" ;;
-		*) reply 0 "invalid state" ;;
-		esac
+		if ! read_device; then
+			reply 0 "invalid device"
+		else
+			case "$state" in
+			on | off) run $BIN power "$state" $device ;;
+			*) reply 0 "invalid state" ;;
+			esac
+		fi
+		;;
+	cycle)
+		if read_device; then
+			run $BIN cycle $device
+		else
+			reply 0 "invalid device"
+		fi
+		;;
+	fix_poweronstate)
+		if read_device; then
+			run $BIN fix-poweronstate $device
+		else
+			reply 0 "invalid device"
+		fi
 		;;
 	clear_logs) run $BIN clear-logs ;;
-	cycle) run $BIN cycle ;;
 	rearm) run $BIN rearm ;;
-	fix_poweronstate) run $BIN fix-poweronstate ;;
 	*) reply 0 "unknown method" ;;
 	esac
 	;;

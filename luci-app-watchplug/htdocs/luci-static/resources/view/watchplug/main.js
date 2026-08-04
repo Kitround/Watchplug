@@ -10,10 +10,12 @@
 var callStatus = rpc.declare({ object: 'luci.watchplug', method: 'status' });
 var callCheck  = rpc.declare({ object: 'luci.watchplug', method: 'check' });
 var callLogs   = rpc.declare({ object: 'luci.watchplug', method: 'logs' });
-var callPower  = rpc.declare({ object: 'luci.watchplug', method: 'power', params: [ 'state' ] });
-var callCycle  = rpc.declare({ object: 'luci.watchplug', method: 'cycle' });
+// 'device' is a uci section name. Empty means every configured device, which is what
+// the CLI does with no argument.
+var callPower  = rpc.declare({ object: 'luci.watchplug', method: 'power', params: [ 'state', 'device' ] });
+var callCycle  = rpc.declare({ object: 'luci.watchplug', method: 'cycle', params: [ 'device' ] });
 var callRearm  = rpc.declare({ object: 'luci.watchplug', method: 'rearm' });
-var callFixPos = rpc.declare({ object: 'luci.watchplug', method: 'fix_poweronstate' });
+var callFixPos = rpc.declare({ object: 'luci.watchplug', method: 'fix_poweronstate', params: [ 'device' ] });
 var callClrLog = rpc.declare({ object: 'luci.watchplug', method: 'clear_logs' });
 
 // Durations always carry a unit. The daemon still reads a bare number as seconds
@@ -114,6 +116,12 @@ function hostChoices(hints) {
 	return out.sort(function(a, b) { return a[1].localeCompare(b[1]); });
 }
 
+// The daemon always writes a devices array; older state files from a running daemon
+// that has not ticked since the upgrade have none, hence the guard.
+function devices(st) {
+	return (st && Array.isArray(st.devices)) ? st.devices : [];
+}
+
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
 		E('td', { 'class': 'td left', 'width': '40%' }, [ label ]),
@@ -163,27 +171,41 @@ function renderStatus(st) {
 		rows.push(row(_('Cycles in 24h'), '%d / %d'.format(
 			parseInt(st.cycles_24h) || 0, parseInt(st.max_cycles) || 0)));
 
-	// A device that answers but rejects the query is a wrong relay name or wrong
-	// credentials — never let that read as "unreachable", which sends people
-	// looking at the network instead of at this form.
-	if (!st.device)
-		rows.push(row(_('Device'), warn(_('not configured'))));
-	else if (st.device_error)
-		rows.push(row(_('Device'), warn('%s (%s) — %s'.format(
-			st.device, st.preset || '?', st.device_error))));
-	else
-		rows.push(row(_('Device'), '%s (%s) — %s'.format(st.device, st.preset || '?',
-			st.device_power && st.device_power != '?'
-				? st.device_power
-				: _('unreachable or state unknown'))));
+	var devs = devices(st);
 
-	if (st.off_time)
-		rows.push(row(_('A cycle switches off for'), '%s %s'.format(duration(st.off_time),
-			_('— it comes back on by itself, give it that long before deciding it failed'))));
+	if (!devs.length)
+		rows.push(row(_('Devices'), warn(_('none configured'))));
+	else if (devs.length > 1)
+		rows.push(row(_('Cycle order'), st.device_mode == 'chain'
+			? _('one after another, %s apart').format(duration(st.device_delay))
+			: _('all at the same time')));
 
-	if (st.poweronstate && st.poweronstate != '?' && st.poweronstate != '1')
-		rows.push(row(_('PowerOnState'), warn(
-			_('%s — the device will not switch back on by itself after a mains outage.').format(st.poweronstate))));
+	devs.forEach(function(d) {
+		var label = d.name || _('unnamed'),
+		    parts = [];
+
+		if (d.enabled != 1)
+			parts.push(_('not cycled'));
+
+		// A device that answers but rejects the query is a wrong relay name or wrong
+		// credentials — never let that read as "unreachable", which sends people
+		// looking at the network instead of at this form.
+		if (!d.configured)
+			rows.push(row(label, warn(_('not configured'))));
+		else if (d.error)
+			rows.push(row(label, warn('%s — %s'.format(d.preset || '?', d.error))));
+		else {
+			parts.unshift(d.power && d.power != '?'
+				? d.power : _('unreachable or state unknown'));
+			if (d.off_time)
+				parts.push(_('off %s per cycle').format(duration(d.off_time)));
+			rows.push(row(label, '%s — %s'.format(d.preset || '?', parts.join(' · '))));
+		}
+
+		if (d.poweronstate && d.poweronstate != '?' && d.poweronstate != '1')
+			rows.push(row('%s — PowerOnState'.format(label), warn(
+				_('%s — it will not switch back on by itself after a mains outage.').format(d.poweronstate))));
+	});
 
 	if (st.message)
 		rows.push(row(_('Info'), st.message));
@@ -261,8 +283,35 @@ function button(label, style, handler) {
 	}, [ label ]);
 }
 
+// One row of buttons per device, so two plugs are never driven by accident. `sec` is
+// the uci section the daemon reported; passing it through scopes every command to
+// that one device, and omitting it means all of them.
+function deviceButtons(d, only) {
+	var sec = only ? (d.section || '') : '',
+	    name = d.name || _('this device');
+
+	return [
+		button(_('Switch on'), 'apply', function() {
+			return action(_('Switch on %s').format(name), function() { return callPower('on', sec); });
+		}),
+		button(_('Switch off'), 'reset', function() {
+			return action(_('Switch off %s').format(name), function() { return callPower('off', sec); });
+		}),
+		button(_('Cycle'), 'negative', function() {
+			var off = d.off_time ? duration(d.off_time) : _('the configured off time');
+			if (!confirm(_('Switch %s off for %s, then back on? Whatever it powers will restart, and it stays off for that long before returning on its own.').format(name, off)))
+				return Promise.resolve();
+			return action(_('Cycle %s').format(name), function() { return callCycle(sec); });
+		}),
+		button(_('Fix PowerOnState'), 'action', function() {
+			return action(_('PowerOnState'), function() { return callFixPos(sec); });
+		})
+	];
+}
+
 function renderActions(st) {
-	var buttons = [
+	var devs = devices(st).filter(function(d) { return d.configured; }),
+	    buttons = [
 		button(_('Check now'), 'action', function() {
 			return callCheck().then(function(res) {
 				notify(!!(res && res.online), res && res.online
@@ -270,21 +319,6 @@ function renderActions(st) {
 					: _('No reply on the monitored interface — %s').format((res && res.output) || ''));
 				return refresh();
 			});
-		}),
-		button(_('Switch on'), 'apply', function() {
-			return action(_('Switch on'), function() { return callPower('on'); });
-		}),
-		button(_('Switch off'), 'reset', function() {
-			return action(_('Switch off'), function() { return callPower('off'); });
-		}),
-		button(_('Force off/on cycle'), 'negative', function() {
-			var off = (st && st.off_time) ? duration(st.off_time) : _('the configured off time');
-			if (!confirm(_('Switch the device off for %s, then back on? Whatever it powers will restart, and the device stays off for that long before returning on its own.').format(off)))
-				return Promise.resolve();
-			return action(_('Cycle'), callCycle);
-		}),
-		button(_('Fix PowerOnState'), 'action', function() {
-			return action(_('PowerOnState'), callFixPos);
 		})
 	];
 
@@ -294,7 +328,17 @@ function renderActions(st) {
 			return action(_('Rearm'), callRearm);
 		}));
 
-	return E('div', { 'id': 'watchplug-actions', 'style': 'margin:.5em 0' }, buttons);
+	var out = [ E('div', { 'style': 'margin:.5em 0' }, buttons) ];
+
+	// With one device the buttons need no heading; with several, each row is labelled
+	// so nobody cuts power to the wrong thing.
+	devs.forEach(function(d) {
+		out.push(E('div', { 'style': 'margin:.5em 0' },
+			(devs.length > 1 ? [ E('strong', { 'style': 'margin-right:.6em' }, [ d.name || _('unnamed') ]) ] : [])
+				.concat(deviceButtons(d, devs.length > 1))));
+	});
+
+	return E('div', { 'id': 'watchplug-actions' }, out);
 }
 
 return view.extend({
@@ -355,6 +399,16 @@ return view.extend({
 		o.datatype = 'range(1,20)';
 		o.depends('limit_cycles', '1');
 
+		o = s.option(form.ListValue, 'device_mode', _('With several devices'),
+			_('Only matters once more than one device is configured on the <em>Devices</em> tab.'));
+		o.value('parallel', _('Cycle them all at the same time'));
+		o.value('chain', _('Cycle them one after another'));
+		o.default = 'parallel';
+
+		o = duration_option(s, 'device_delay', _('Wait between devices'),
+			_('Time left between two devices in the chain — long enough for the first to be back before the next one is cut.'), '30s');
+		o.depends('device_mode', 'chain');
+
 		o = duration_option(s, 'recovery_grace', _('Grace after a cycle'),
 			_('Time given to the equipment to come back and the link to recover before monitoring resumes.'), '10m');
 		o.optional = true;
@@ -374,9 +428,22 @@ return view.extend({
 		o = duration_option(s, 'ping_timeout', _('Ping timeout'), null, '3s', 60);
 		o.optional = true;
 
-		s = m.section(form.NamedSection, 'plug', 'plug', _('Devices'),
-			_('Any device with an HTTP API: smart plug, relay board, home-automation hub. Give it a static address the router can reach.'));
+		// Anonymous sections of type 'device', added and removed from the page, the way
+		// LuCI models a list of like things everywhere else.
+		s = m.section(form.TypedSection, 'device', _('Devices'),
+			_('Any device with an HTTP API: smart plug, relay board, home-automation hub. Give each a static address the router can reach. Add as many as you need — they are all driven together when the link stays down.'));
 		s.anonymous = true;
+		s.addremove = true;
+		s.addbtntitle = _('Add device');
+
+		o = s.option(form.Flag, 'enabled', _('Cycle this device'),
+			_('Unchecked, the device is left alone by the automatic cycle but stays visible and drivable by hand.'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'name', _('Name'),
+			_('Shown on the status page, on its buttons and in the log. Useful once there is more than one.'));
+		o.placeholder = _('ONT, modem, camera…');
 
 		o = s.option(form.ListValue, 'preset', _('Device type'));
 		o.value('tasmota', _('Tasmota (built-in)'));

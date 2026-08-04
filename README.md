@@ -49,6 +49,10 @@ LuCI renders its pages server-side.
   the link is down. Two independent switches change that — spacing out repeated attempts
   (doubling, 20 min, 40, 80…) and a cap of N cycles per rolling 24 hours, which moves the app to a
   `blocked` state. Both off by default.
+- **Several devices**, each with its own address, credentials and off time. Cycle them together or
+  one after another with a wait between — an ONT that has to be back before the router is cut.
+  Any of them can be left out of the automatic cycle without being deleted, and each keeps its own
+  buttons.
 - **Status stays live while disarmed**, so you can wire everything up and watch it before you let
   it act.
 
@@ -93,9 +97,9 @@ apk add --allow-untrusted /tmp/luci-app-watchplug_openwrt-25.12_all.apk
 settings — an upgrade keeps whatever an older release wrote.
 
 The page shows up under **Services → Watchplug**, with four tabs: *General* (status and manual
-buttons), *Settings* (monitoring), *Devices* (the controlled device) and *Logs*.
+buttons), *Settings* (monitoring), *Devices* (the controlled devices) and *Logs*.
 
-Monitoring is **off by default**: fill in the device details, try the buttons, watch the status —
+Monitoring is **off by default**: add your devices, try the buttons, watch the status —
 it stays live while disarmed — then tick "Enable monitoring".
 
 ## Settings
@@ -115,17 +119,21 @@ older configs keep working.
 | `limit_cycles` | `0` | Off: retries as long as the link is down. On: enforces `max_cycles`. |
 | `max_cycles` | `3` | Only with `limit_cycles=1`. Cap per rolling 24 hours. Past that: `blocked`. |
 | `recovery_grace` | `10m` | Time given to the equipment to come back and the link to recover after a cycle. |
+| `device_mode` | `parallel` | With several devices: `parallel` cycles them together, `chain` one after another. |
+| `device_delay` | `30s` | Only with `device_mode=chain`. Wait between two devices in the chain. |
 | `boot_delay` | `5m` | No action while router uptime is below this value. |
 | `interval` | `1m` | Check interval. |
-| `plug.preset` | `tasmota` | `tasmota` or `custom`. |
-| `plug.host` | — | Address of the device, also available as `{host}` in custom URLs. |
-| `plug.relay` | `Power` | Tasmota only. `Power` for a single-relay device. |
-| `plug.user` / `plug.password` | — | Web authentication, if enabled. |
-| `plug.off_time` | `30s` | Time in the off state. Capped at 6 min under the Tasmota preset, which is `Delay`'s own ceiling; a custom cycle URL is not limited. |
-| `plug.enforce_poweronstate` | `1` | Tasmota only. Forces `PowerOnState 1`. |
-| `plug.url_on` / `url_off` | — | `custom` only. Switch-on and switch-off endpoints. |
-| `plug.url_cycle` | — | `custom` only. Single call doing off-wait-on on the device side. Strongly preferred over letting the router hold the timer. |
-| `plug.url_state` / `state_key` | — | `custom` only. Polled for display; `state_key` picks a JSON key out of the reply. |
+| `device.enabled` | `1` | `0` leaves the device out of the automatic cycle without deleting it. |
+| `device.name` | — | Shown on the status page, its buttons and the log. |
+| `device.preset` | `tasmota` | `tasmota` or `custom`. |
+| `device.host` | — | Address of the device, also available as `{host}` in custom URLs. |
+| `device.relay` | `Power` | Tasmota only. `Power` for a single-relay device. |
+| `device.user` / `device.password` | — | Web authentication, if enabled. |
+| `device.off_time` | `30s` | Time in the off state. Capped at 6 min under the Tasmota preset, which is `Delay`'s own ceiling; a custom cycle URL is not limited. |
+| `device.enforce_poweronstate` | `1` | Tasmota only. Forces `PowerOnState 1`. |
+| `device.url_on` / `url_off` | — | `custom` only. Switch-on and switch-off endpoints. |
+| `device.url_cycle` | — | `custom` only. Single call doing off-wait-on on the device side. Strongly preferred over letting the router hold the timer. |
+| `device.url_state` / `state_key` | — | `custom` only. Polled for display; `state_key` picks a JSON key out of the reply. |
 
 ## States
 
@@ -146,10 +154,11 @@ watchplug check               # one immediate check, exit 0 means online
 watchplug status              # last known state, JSON
 watchplug logs [n]            # last n activity lines (default 200)
 watchplug clear-logs          # empty the activity log
-watchplug power on|off
-watchplug cycle               # manual power cycle
+watchplug devices             # list the configured devices and their uci sections
+watchplug power on|off [dev]  # one device, or every configured one
+watchplug cycle [dev]         # manual power cycle
 watchplug rearm               # clear the cycle history, unblocking the 24h cap
-watchplug fix-poweronstate
+watchplug fix-poweronstate [dev]
 watchplug selftest            # threshold / backoff / encoding helpers
 ```
 

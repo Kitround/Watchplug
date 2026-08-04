@@ -14,8 +14,16 @@ config watchplug 'main'
 	option backoff_max '4h'
 	option limit_cycles '0'
 	option max_cycles '3'
+	# with several devices: 'parallel' cycles them together, 'chain' one after
+	# another, device_delay apart
+	option device_mode 'parallel'
+	option device_delay '30s'
 
-config plug 'plug'
+# One section per device, added and removed from the Devices tab. A device with
+# enabled '0' is left out of the automatic cycle but stays drivable by hand.
+config device
+	option enabled '1'
+	option name ''
 	option preset 'tasmota'
 	option host ''
 	option port '80'
