@@ -1,8 +1,7 @@
 # Watchplug
 
 A LuCI app for OpenWrt that drives an **HTTP-controlled device** from the connectivity state of a
-**router interface**. When the monitored link stays down long enough, the device is switched off
-and back on.
+**router interface**.
 
 The obvious use is rebooting an upstream modem through a smart plug when the WAN dies, which is
 the escalation layer above `watchcat`: watchcat restarts the interface, Watchplug restarts the
