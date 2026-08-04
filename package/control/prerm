@@ -1,0 +1,8 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+/etc/init.d/watchplug stop >/dev/null 2>&1
+/etc/init.d/watchplug disable >/dev/null 2>&1
+rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
+
+exit 0

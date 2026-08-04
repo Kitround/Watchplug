@@ -1,0 +1,17 @@
+{
+	"luci-app-watchplug": {
+		"description": "Grant access to Watchplug",
+		"read": {
+			"uci": [ "watchplug" ],
+			"ubus": {
+				"luci.watchplug": [ "status", "check", "logs" ]
+			}
+		},
+		"write": {
+			"uci": [ "watchplug" ],
+			"ubus": {
+				"luci.watchplug": [ "power", "cycle", "rearm", "fix_poweronstate", "clear_logs" ]
+			}
+		}
+	}
+}

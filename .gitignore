@@ -1,0 +1,5 @@
+build/
+*.ipk
+
+# Agent notes: useful to whoever edits this, useless to whoever installs it.
+CLAUDE.md

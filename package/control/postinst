@@ -1,0 +1,11 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+/etc/init.d/rpcd reload >/dev/null 2>&1
+rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
+
+# Safe to start unconditionally: the daemon idles until "enabled" is set in LuCI.
+/etc/init.d/watchplug enable >/dev/null 2>&1
+/etc/init.d/watchplug restart >/dev/null 2>&1
+
+exit 0

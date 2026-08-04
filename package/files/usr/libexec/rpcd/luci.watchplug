@@ -1,0 +1,80 @@
+#!/bin/sh
+# ubus backend for the Watchplug LuCI view -- every method delegates to /usr/sbin/watchplug.
+. /usr/share/libubox/jshn.sh
+
+BIN=/usr/sbin/watchplug
+
+reply() { # reply <ok 0|1> <output>
+	json_init
+	json_add_boolean ok "$1"
+	json_add_string output "$(echo "$2" | tr -d '\n' | tr -d '"')"
+	json_dump
+}
+
+run() {
+	out=$("$@" 2>&1)
+	rc=$?
+	[ $rc -eq 0 ] && reply 1 "$out" || reply 0 "$out"
+}
+
+case "$1" in
+list)
+	json_init
+	json_add_object status
+	json_close_object
+	json_add_object check
+	json_close_object
+	json_add_object logs
+	json_close_object
+	json_add_object clear_logs
+	json_close_object
+	json_add_object power
+	json_add_string state ""
+	json_close_object
+	json_add_object cycle
+	json_close_object
+	json_add_object rearm
+	json_close_object
+	json_add_object fix_poweronstate
+	json_close_object
+	json_dump
+	;;
+call)
+	case "$2" in
+	status)
+		$BIN status
+		;;
+	logs)
+		# jshn does the quoting, so newlines survive the trip to the browser
+		json_init
+		json_add_string log "$($BIN logs 200)"
+		json_dump
+		;;
+	check)
+		if out=$($BIN check 2>&1); then
+			json_init
+			json_add_boolean online 1
+		else
+			json_init
+			json_add_boolean online 0
+		fi
+		json_add_string output "$(echo "$out" | tr -d '\n"')"
+		json_dump
+		;;
+	power)
+		read -r input
+		json_load "$input"
+		json_get_var state state
+		case "$state" in
+		on | off) run $BIN power "$state" ;;
+		*) reply 0 "invalid state" ;;
+		esac
+		;;
+	clear_logs) run $BIN clear-logs ;;
+	cycle) run $BIN cycle ;;
+	rearm) run $BIN rearm ;;
+	fix_poweronstate) run $BIN fix-poweronstate ;;
+	*) reply 0 "unknown method" ;;
+	esac
+	;;
+esac

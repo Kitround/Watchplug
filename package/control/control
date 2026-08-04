@@ -1,0 +1,14 @@
+Package: luci-app-watchplug
+Version: @VERSION@
+Depends: luci-base, jshn
+Architecture: all
+Installed-Size: @SIZE@
+Section: luci
+Category: LuCI
+Maintainer: Watchplug
+Description: Watchplug - drive an HTTP-controlled device from the connectivity
+ state of a router interface. Pings out of the monitored device itself, so a
+ failover route cannot hide the outage; after a configurable delay it cycles the
+ device off and back on, retrying until the link returns. Optional backoff and
+ cycle cap. Built-in Tasmota support, or free-form URLs for any other HTTP
+ device. Fully configurable from LuCI.

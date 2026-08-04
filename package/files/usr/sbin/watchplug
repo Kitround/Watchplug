@@ -1,0 +1,771 @@
+#!/bin/sh
+# Watchplug -- drive an HTTP-controlled device from the connectivity state of a router interface.
+# Single implementation: the procd daemon, the CLI and the rpcd backend all call into here.
+
+RUNDIR=${WATCHPLUG_RUN:-/var/run}   # overridable so a harness can drive the real loop
+STATE_FILE=$RUNDIR/watchplug.json
+CYCLES_FILE=$RUNDIR/watchplug.cycles
+REARM_FILE=$RUNDIR/watchplug.rearm
+LOG_FILE=$RUNDIR/watchplug.log
+LOG_KEEP=400          # lines retained in the activity log
+WINDOW=86400          # rolling window for the optional cycle cap (24 h)
+TASMOTA_MAX_DELAY=360 # Backlog "Delay" tops out at 3600 tenths of a second
+
+# Activity log, shown in the Logs tab. Deliberately not syslog: one line per check
+# would fill the router's 64 KB ring buffer in half a day and evict everything else.
+# Helper locals are underscore-prefixed throughout: sh has no scoping, and act()
+# silently clobbering a caller's counter is exactly the kind of bug that hides.
+act() {
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null
+	# ponytail: trim only once past the cap, not on every line
+	_n=$(wc -l <"$LOG_FILE" 2>/dev/null) || return 0
+	if [ "$_n" -gt $((LOG_KEEP + 100)) ]; then
+		tail -n "$LOG_KEEP" "$LOG_FILE" >"$LOG_FILE.tmp" 2>/dev/null &&
+			mv "$LOG_FILE.tmp" "$LOG_FILE"
+	fi
+}
+
+# Events go to both: syslog for anyone watching logread, activity log for the UI.
+log() {
+	_lvl=$1
+	shift
+	logger -t watchplug -p "daemon.$_lvl" "$*" 2>/dev/null || echo "watchplug[$_lvl] $*" >&2
+	case "$_lvl" in
+	err) act "[error] $*" ;;
+	warn) act "[warn ] $*" ;;
+	*) act "[info ] $*" ;;
+	esac
+}
+
+cfg() { # cfg <section> <option> <default>
+	_val=$(uci -q get "watchplug.$1.$2" 2>/dev/null)
+	if [ -n "$_val" ]; then printf '%s' "$_val"; else printf '%s' "$3"; fi
+}
+
+# secs <value> : durations -- 30s, 5m, 1h, 7d -> seconds. LuCI now requires the
+# unit, but a bare number is still read as seconds so configs written before that
+# rule (and hand-edited ones) keep working.
+secs() {
+	_v=$(echo "$1" | tr 'SMHD' 'smhd')
+	_n=${_v%[smhd]}
+	case "$_v" in
+	*m) _u=60 ;;
+	*h) _u=3600 ;;
+	*d) _u=86400 ;;
+	*) _u=1 ;;
+	esac
+	[ "$_n" -ge 0 ] 2>/dev/null || _n=0
+	echo $((_n * _u))
+}
+
+load_config() {
+	enabled=$(cfg main enabled 0)
+	interval=$(secs "$(cfg main interval 1m)")
+	targets=$(cfg main targets '1.1.1.1 9.9.9.9 8.8.8.8')
+	wan_iface=$(cfg main wan_iface wan)
+	ping_count=$(cfg main ping_count 2)
+	ping_timeout=$(secs "$(cfg main ping_timeout 3s)")
+	down_time=$(secs "$(cfg main down_time 20m)")
+	boot_delay=$(secs "$(cfg main boot_delay 5m)")
+	recovery_grace=$(secs "$(cfg main recovery_grace 10m)")
+	limit_cycles=$(cfg main limit_cycles 0)
+	max_cycles=$(cfg main max_cycles 3)
+	backoff=$(cfg main backoff 0)
+	backoff_max=$(secs "$(cfg main backoff_max 4h)")
+	[ "$limit_cycles" = 1 ] || limit_cycles=0
+	[ "$backoff" = 1 ] || backoff=0
+
+	preset=$(cfg plug preset tasmota)
+	plug_host=$(cfg plug host '')
+	plug_port=$(cfg plug port 80)
+	relay=$(cfg plug relay Power)
+	plug_user=$(cfg plug user '')
+	plug_password=$(cfg plug password '')
+	off_time=$(secs "$(cfg plug off_time 30s)")
+	http_timeout=$(secs "$(cfg plug http_timeout 5s)")
+	enforce_pos=$(cfg plug enforce_poweronstate 1)
+
+	url_on=$(cfg plug url_on '')
+	url_off=$(cfg plug url_off '')
+	url_cycle=$(cfg plug url_cycle '')
+	url_state=$(cfg plug url_state '')
+	state_key=$(cfg plug state_key '')
+
+	# The Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL.
+	[ "$preset" = tasmota ] && [ "$off_time" -gt "$TASMOTA_MAX_DELAY" ] 2>/dev/null &&
+		off_time=$TASMOTA_MAX_DELAY
+	[ "$off_time" -lt 1 ] 2>/dev/null && off_time=1
+	# /etc/config/watchplug is a conffile: it survives upgrades and gets hand-edited,
+	# so every value reaching a loop, a ping argument or the state JSON is checked here.
+	# An empty or non-numeric interval would turn the daemon loop into a busy loop; a
+	# down_time of 0 would cycle the device on the first failed ping; a bad ping_count
+	# makes ping bail out on every check, which reads as a permanent outage and cycles
+	# the equipment forever; a bad max_cycles lands unquoted in the state JSON and
+	# takes the whole status page down with it.
+	[ "$interval" -ge 1 ] 2>/dev/null || interval=60
+	[ "$down_time" -ge 1 ] 2>/dev/null || down_time=1200
+	[ "$ping_count" -ge 1 ] 2>/dev/null || ping_count=2
+	[ "$ping_timeout" -ge 1 ] 2>/dev/null || ping_timeout=3
+	[ "$max_cycles" -ge 1 ] 2>/dev/null || max_cycles=3
+	# backoff_max=0 would clamp every threshold to 0 and cycle on every tick
+	[ "$backoff_max" -ge 1 ] 2>/dev/null || backoff_max=14400
+	[ "$http_timeout" -ge 1 ] 2>/dev/null || http_timeout=5
+	[ "$enabled" = 1 ] || enabled=0
+}
+
+# --- pure helpers (no network, no uci -- covered by `watchplug selftest`) -----
+
+upper() { echo "$1" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; }
+
+# prune_cycles <now> <window> <ts...> : keep only timestamps inside the window
+prune_cycles() {
+	pnow=$1
+	pwin=$2
+	shift 2
+	out=
+	for ts in "$@"; do
+		[ $((pnow - ts)) -lt "$pwin" ] && out="$out $ts"
+	done
+	echo "${out# }"
+}
+
+# threshold <down_time> <cycles_this_outage> <max> : doubles per attempt, clamped
+threshold() {
+	t=$1
+	n=$2
+	max=$3
+	while [ "$n" -gt 0 ]; do
+		t=$((t * 2))
+		n=$((n - 1))
+		if [ "$t" -ge "$max" ]; then
+			t=$max
+			break
+		fi
+	done
+	echo "$t"
+}
+
+# ponytail: only encodes what a Tasmota command line can actually contain
+urlencode() {
+	echo "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/;/%3B/g' -e 's/&/%26/g' \
+		-e 's/?/%3F/g' -e 's/=/%3D/g' -e 's/+/%2B/g' -e 's/#/%23/g'
+}
+
+# ponytail: naive scrape, enough for Tasmota's flat one-key replies ({"POWER":"ON"})
+json_field() {
+	echo "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' | head -n1
+}
+
+esc() { printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '; }
+
+# hms <seconds> : compact, readable durations for the log
+hms() {
+	s=$1
+	if [ "$s" -ge 3600 ]; then
+		echo "$((s / 3600))h$(((s % 3600) / 60))m"
+	elif [ "$s" -ge 60 ]; then
+		echo "$((s / 60))m$((s % 60))s"
+	else
+		echo "${s}s"
+	fi
+}
+
+# Never write a device password into a log file -- the activity log is served to
+# anyone who opens the LuCI tab. Masking "password=" alone only covers the Tasmota
+# preset: a custom URL can carry the secret under any parameter name, or in the
+# userinfo of "http://user:pass@host/". So the configured value is struck out
+# literally as well, wherever it landed -- in both spellings, raw and percent-encoded,
+# since expand_url() encodes what it injects.
+mask() {
+	_m=$(echo "$1" | sed -e 's/password=[^&]*/password=***/g')
+	for _p in "$plug_password" "$(urlencode "$plug_password")"; do
+		[ -n "$_p" ] || continue
+		case "$_m" in
+		*"$_p"*) _m="${_m%%"$_p"*}***${_m#*"$_p"}" ;;
+		esac
+	done
+	echo "$_m"
+}
+
+# escape a value before using it as a sed replacement
+sed_rep() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }
+
+# expand_url <template> : {host} {port} {user} {password} {off_time} {off_ds}
+# off_ds is tenths of a second, which is what most timed-relay APIs want.
+# Credentials are percent-encoded like the Tasmota preset already does: an "&" or
+# a "?" in a password would otherwise cut the query short and send a broken request.
+expand_url() {
+	echo "$1" | sed \
+		-e "s|{host}|$(sed_rep "$plug_host")|g" \
+		-e "s|{port}|$(sed_rep "$plug_port")|g" \
+		-e "s|{user}|$(sed_rep "$(urlencode "$plug_user")")|g" \
+		-e "s|{password}|$(sed_rep "$(urlencode "$plug_password")")|g" \
+		-e "s|{off_time}|$off_time|g" \
+		-e "s|{off_ds}|$((off_time * 10))|g"
+}
+
+uptime_s() {
+	[ -r /proc/uptime ] || { echo 999999; return; }
+	cut -d. -f1 /proc/uptime
+}
+
+# --- connectivity -------------------------------------------------------------
+
+resolve_wan() {
+	[ -r /lib/functions/network.sh ] || return 0
+	. /lib/functions/network.sh
+	network_flush_cache
+	network_get_device dev "$wan_iface" && echo "$dev"
+}
+
+# Bound to the monitored device on purpose: a failover route must not hide the outage.
+check_conn() {
+	wan_device=$(resolve_wan)
+	if [ -z "$wan_device" ]; then
+		message="interface $wan_iface has no device"
+		check_detail="interface $wan_iface has no device (link down?)"
+		return 1
+	fi
+	for _t in $targets; do
+		if ping -I "$wan_device" -c "$ping_count" -W "$ping_timeout" "$_t" >/dev/null 2>&1; then
+			check_detail="$_t replied via $wan_device"
+			return 0
+		fi
+	done
+	check_detail="no reply from $(echo $targets | tr ' ' ',') via $wan_device (${ping_count}x${ping_timeout}s each)"
+	message=""
+	return 1
+}
+
+# --- controlled device --------------------------------------------------------
+#
+# Two ways to drive it:
+#   preset=tasmota  built-in, uses Tasmota's /cm command API
+#   preset=custom   free-form URLs, for any device with an HTTP endpoint
+#
+# Only Tasmota can run the off delay on the device side (Backlog + Delay). With
+# custom URLs the timer lives in the router unless url_cycle does it remotely.
+
+# http_quiet=1 silences the log for the periodic state poll; every command the app
+# actually issues is logged with its reply, password stripped.
+http_get() {
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		_out=$(uclient-fetch -q -T "$http_timeout" -O - "$1" 2>/dev/null)
+	else
+		_out=$(wget -q -T "$http_timeout" -O - "$1" 2>/dev/null)
+	fi
+	_rc=$?
+	# The log is trimmed by lines, not by bytes, and it lives in RAM: one chatty or
+	# hostile device answering a megabyte would fill the tmpfs and push the "logs"
+	# ubus reply past the message size limit, taking the Logs tab down with it.
+	[ "$http_quiet" = 1 ] ||
+		act "[http ] $(mask "$1") -> $(printf '%s' "${_out:-<no reply, rc=$_rc>}" | head -c 200 | tr -d '\n')"
+	printf '%s' "$_out"
+	return $_rc
+}
+
+# A 200 OK is not success: Tasmota answers "Command":"Unknown" for a bad relay name
+# and a WARNING body when authentication is wrong, both with a 2xx status.
+reply_ok() {
+	case "$1" in
+	'') return 1 ;;
+	*'"WARNING"'*) return 1 ;;
+	*'"Command":"Unknown"'*) return 1 ;;
+	*'"Command":"Error"'*) return 1 ;;
+	esac
+	return 0
+}
+
+tasmota() { # tasmota <command>
+	if [ -z "$plug_host" ]; then
+		echo "device address not configured" >&2
+		return 1
+	fi
+	auth=""
+	[ -n "$plug_user" ] && auth="user=$(urlencode "$plug_user")&password=$(urlencode "$plug_password")&"
+	http_get "http://$plug_host:$plug_port/cm?${auth}cmnd=$(urlencode "$1")"
+}
+
+device_configured() {
+	case "$preset" in
+	tasmota) [ -n "$plug_host" ] ;;
+	*) [ -n "$url_on" ] || [ -n "$url_off" ] || [ -n "$url_cycle" ] ;;
+	esac
+}
+
+device_label() {
+	case "$preset" in
+	tasmota) echo "$plug_host" ;;
+	*) [ -n "$plug_host" ] && echo "$plug_host" || echo "custom URL" ;;
+	esac
+}
+
+device_power() { # device_power on|off
+	if [ "$preset" = tasmota ]; then
+		_r=$(tasmota "$relay $1") || return 1
+		if ! reply_ok "$_r"; then
+			log err "device $(device_label) refused '$relay $1': ${_r:-no reply}"
+			echo "${_r:-no reply from $(device_label)}"
+			return 1
+		fi
+		echo "$_r"
+		return 0
+	fi
+
+	case "$1" in
+	on) _u=$url_on ;;
+	off) _u=$url_off ;;
+	*)
+		echo "unknown action '$1'" >&2
+		return 1
+		;;
+	esac
+	if [ -z "$_u" ]; then
+		echo "no URL configured for '$1'" >&2
+		return 1
+	fi
+	http_get "$(expand_url "$_u")"
+}
+
+poll_device() {
+	plug_power='?'
+	plug_pos='?'
+	plug_err=''
+	device_configured || return 0
+	http_quiet=1
+
+	if [ "$preset" = tasmota ]; then
+		_pr=$(tasmota "$relay")
+		# An answer that is not a state answer is a configuration problem, not an
+		# outage. Without this, a wrong relay name and a wrong password both come
+		# out as an empty field and read exactly like an unplugged device, which
+		# sends the user hunting the network instead of the credentials.
+		if [ -n "$_pr" ] && ! reply_ok "$_pr"; then
+			plug_err="rejected the state query: $_pr"
+			# once per transition, not once per tick
+			[ "$poll_warned" = 1 ] ||
+				log warn "device $(device_label) $plug_err -- check the relay name and, if Tasmota web authentication is on, the credentials"
+			poll_warned=1
+			http_quiet=0
+			return 0
+		fi
+		poll_warned=0
+		plug_power=$(json_field "$_pr" "$(upper "$relay")")
+		plug_pos=$(json_field "$(tasmota PowerOnState)" PowerOnState)
+		[ -n "$plug_pos" ] || plug_pos='?'
+		# Without PowerOnState=1, a mains outage during the off window leaves the
+		# controlled equipment dead for good.
+		if [ "$enforce_pos" = 1 ] && [ "$plug_pos" != '?' ] && [ "$plug_pos" != 1 ]; then
+			log warn "PowerOnState=$plug_pos forced to 1 (otherwise the device stays off after a mains outage)"
+			http_quiet=0
+			tasmota "PowerOnState 1" >/dev/null 2>&1 && plug_pos=1
+		fi
+	elif [ -n "$url_state" ]; then
+		_reply=$(http_get "$(expand_url "$url_state")")
+		if [ -n "$state_key" ]; then
+			plug_power=$(json_field "$_reply" "$state_key")
+		else
+			plug_power=$(echo "$_reply" | head -c 32 | tr -d '\n')
+		fi
+	fi
+	[ -n "$plug_power" ] || plug_power='?'
+	http_quiet=0
+}
+
+# Prefer a delay run by the device itself: if the router dies mid-cut, the device
+# still comes back on its own.
+do_cycle() {
+	log warn "power-cycling $(device_label) (${preset} preset, ${off_time}s off)"
+
+	if [ "$preset" = tasmota ]; then
+		_r=$(tasmota "Backlog ${relay} off; Delay $((off_time * 10)); ${relay} on")
+		if ! reply_ok "$_r"; then
+			log err "device $(device_label) refused the cycle command: ${_r:-no reply}. Check the relay name and, if Tasmota web authentication is on, the credentials."
+			return 1
+		fi
+	elif [ -n "$url_cycle" ]; then
+		if ! http_get "$(expand_url "$url_cycle")" >/dev/null; then
+			log err "cycle URL failed"
+			return 1
+		fi
+		return 0
+	else
+		if ! device_power off >/dev/null; then
+			log err "off URL failed"
+			return 1
+		fi
+		# ponytail: router-side timer, the only option without a remote cycle URL.
+		# A reboot during the window leaves the device off -- hence the warning in LuCI.
+		(
+			sleep "$off_time"
+			device_power on
+		) >/dev/null 2>&1 &
+		return 0
+	fi
+
+	# ponytail: belt and braces if Backlog was refused; a second "on" is harmless.
+	# The whole subshell is redirected so it does not hold rpcd's stdout open for 35 s.
+	(
+		sleep $((off_time + 5))
+		tasmota "${relay} on"
+	) >/dev/null 2>&1 &
+	return 0
+}
+
+record_cycle() { # record_cycle <now>
+	_kept=$(prune_cycles "$1" "$WINDOW" $(cat "$CYCLES_FILE" 2>/dev/null))
+	echo "$_kept $1" >"$CYCLES_FILE"
+}
+
+# --- state --------------------------------------------------------------------
+
+write_state() {
+	down_for=0
+	[ "$down_since" != 0 ] && down_for=$((now - down_since))
+	eta=-1
+	if [ "$state" = degraded ] && [ "$down_since" != 0 ]; then
+		eta=$((thr - (now - since)))
+		[ "$eta" -lt 0 ] && eta=0
+	fi
+	[ "$state" = cooldown ] && eta=$((cooldown_until - now))
+
+	# One activity line per tick: every path through tick() lands here exactly once.
+	sum="[check] ${check_detail:-not checked}"
+	[ "$down_since" != 0 ] && sum="$sum | offline for $(hms "$down_for")"
+	case "$state" in
+	degraded) [ "$eta" -ge 0 ] && sum="$sum | cycling in $(hms "$eta")" ;;
+	cooldown) [ "$eta" -ge 0 ] && sum="$sum | grace ends in $(hms "$eta")" ;;
+	blocked) sum="$sum | BLOCKED, $cycles_24h/$max_cycles cycles used" ;;
+	disabled) sum="$sum | monitoring disarmed, no action" ;;
+	esac
+	device_configured && sum="$sum | device $(device_label)=$plug_power"
+	[ -n "$plug_err" ] && sum="$sum | $plug_err"
+	[ -n "$message" ] && sum="$sum | $message"
+	act "$sum -> state $state"
+
+	# Written aside then moved into place: the LuCI page polls "status" every 5 s
+	# and would otherwise be able to read a half-truncated file as invalid JSON.
+	cat >"$STATE_FILE.tmp" <<EOF
+{
+	"state": "$state",
+	"online": $online,
+	"enabled": $enabled,
+	"interval": $interval,
+	"wan_iface": "$(esc "$wan_iface")",
+	"wan_device": "$(esc "$wan_device")",
+	"down_since": $down_since,
+	"down_for": $down_for,
+	"cooldown_until": $cooldown_until,
+	"threshold": $thr,
+	"eta": $eta,
+	"last_check": $now,
+	"last_cycle": $last_cycle,
+	"backoff": $backoff,
+	"limit_cycles": $limit_cycles,
+	"cycles_24h": $cycles_24h,
+	"max_cycles": $max_cycles,
+	"off_time": $off_time,
+	"preset": "$(esc "$preset")",
+	"device": "$(esc "$(device_label)")",
+	"device_power": "$(esc "$plug_power")",
+	"poweronstate": "$(esc "$plug_pos")",
+	"device_error": "$(esc "$plug_err")",
+	"message": "$(esc "$message")"
+}
+EOF
+	mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# --- daemon -------------------------------------------------------------------
+
+tick() {
+	now=$(date +%s)
+	message=""
+
+	# One pass over the cycle history gives the retry clock (restart-safe), the 24h
+	# count for the optional cap, and the attempt number for the optional backoff.
+	last_cycle=0
+	cycles_24h=0
+	cycles_outage=0
+	for ts in $(prune_cycles "$now" "$WINDOW" $(cat "$CYCLES_FILE" 2>/dev/null)); do
+		last_cycle=$ts
+		cycles_24h=$((cycles_24h + 1))
+		[ "$down_since" != 0 ] && [ "$ts" -ge "$down_since" ] && cycles_outage=$((cycles_outage + 1))
+	done
+
+	thr=$down_time
+	[ "$backoff" = 1 ] && thr=$(threshold "$down_time" "$cycles_outage" "$backoff_max")
+
+	if [ -f "$REARM_FILE" ]; then
+		rm -f "$REARM_FILE" "$CYCLES_FILE"
+		down_since=0
+		cooldown_until=0
+		last_cycle=0
+		cycles_24h=0
+		thr=$down_time
+		log info "rearmed from the web interface"
+	fi
+
+	# Poll before the enabled check: the status page must show the real device and
+	# link state even while monitoring is disarmed. check_conn sets wan_device.
+	poll_device
+	if check_conn; then online=true; else online=false; fi
+
+	if [ "$enabled" != 1 ]; then
+		state=disabled
+		down_since=0
+		cooldown_until=0
+		write_state
+		return 0
+	fi
+
+	if [ "$online" = true ]; then
+		if [ "$down_since" != 0 ]; then
+			log info "connection restored after $((now - down_since))s"
+			down_since=0
+		fi
+		state=ok
+		write_state
+		return 0
+	fi
+
+	if [ "$down_since" = 0 ]; then
+		down_since=$now
+		log warn "connection lost on ${wan_device:-$wan_iface}"
+	fi
+	state=degraded
+
+	# Retry clock runs from the last cycle once there has been one, so each attempt
+	# gets a full threshold of its own instead of firing back to back.
+	since=$down_since
+	[ "$last_cycle" -gt "$since" ] && since=$last_cycle
+
+	up=$(uptime_s)
+	if [ "$up" -lt "$boot_delay" ]; then
+		message="recent boot, action held off"
+	elif [ "$now" -lt "$cooldown_until" ]; then
+		state=cooldown
+	elif [ "$limit_cycles" = 1 ] && [ "$cycles_24h" -ge "$max_cycles" ]; then
+		state=blocked
+		message="cap of $max_cycles cycles per 24h reached"
+	elif [ $((now - since)) -ge "$thr" ]; then
+		if do_cycle; then
+			last_cycle=$now
+			since=$now
+			record_cycle "$now"
+			cycles_24h=$((cycles_24h + 1))
+			cooldown_until=$((now + recovery_grace))
+			state=cooldown
+		else
+			message="device unreachable"
+		fi
+	fi
+	write_state
+}
+
+daemon() {
+	# The outage clock survives a restart. Saving anything in LuCI fires the config
+	# reload trigger, which procd turns into a restart since there is no
+	# reload_service: without this, adjusting one field 19 minutes into a 20 minute
+	# down_time would silently start the countdown over. The state file lives in
+	# tmpfs, so a real reboot still starts clean -- which is what boot_delay is for.
+	_prev=$(cat "$STATE_FILE" 2>/dev/null)
+	down_since=$(json_field "$_prev" down_since)
+	cooldown_until=$(json_field "$_prev" cooldown_until)
+	[ "$down_since" -ge 0 ] 2>/dev/null || down_since=0
+	[ "$cooldown_until" -ge 0 ] 2>/dev/null || cooldown_until=0
+	since=0
+	last_cycle=0
+	plug_power='?'
+	plug_pos='?'
+	plug_err=''
+	poll_warned=0
+	http_quiet=0
+	log info "daemon starting"
+	while :; do
+		load_config
+		tick
+		sleep "$interval"
+	done
+}
+
+# --- selftest -----------------------------------------------------------------
+
+assert_eq() {
+	if [ "$1" != "$2" ]; then
+		echo "FAIL: $3 -- expected '$2', got '$1'" >&2
+		exit 1
+	fi
+	echo "ok: $3"
+}
+
+selftest() {
+	assert_eq "$(secs 90)" 90 "legacy bare number still read as seconds"
+	assert_eq "$(secs 10s)" 10 "s suffix"
+	assert_eq "$(secs 20m)" 1200 "m suffix"
+	assert_eq "$(secs 4h)" 14400 "h suffix"
+	assert_eq "$(secs 7d)" 604800 "d suffix"
+	assert_eq "$(secs 5M)" 300 "suffix is case insensitive"
+	assert_eq "$(secs 0)" 0 "zero"
+	assert_eq "$(secs abc)" 0 "garbage value neutralised"
+
+	assert_eq "$(threshold 1200 0 14400)" 1200 "first threshold equals down_time"
+	assert_eq "$(threshold 1200 1 14400)" 2400 "backoff x2 after one cycle"
+	assert_eq "$(threshold 1200 9 14400)" 14400 "backoff clamped to backoff_max"
+	assert_eq "$(threshold 60 3 100)" 100 "clamped even when doubling overshoots"
+
+	assert_eq "$(prune_cycles 100000 86400 10000 99000)" "99000" "24h window drops the old cycle"
+	assert_eq "$(prune_cycles 100000 86400 13601 99999)" "13601 99999" "exact window boundary"
+	assert_eq "$(prune_cycles 100000 86400)" "" "empty history stays empty"
+
+	reply_ok '{"POWER":"ON"}' && r=ok || r=fail
+	assert_eq "$r" ok "a normal reply is accepted"
+	reply_ok '{"Backlog":"Done"}' && r=ok || r=fail
+	assert_eq "$r" ok "a Backlog acknowledgement is accepted"
+	reply_ok '{"WARNING":"Need user=<username>&password=<password>"}' && r=ok || r=fail
+	assert_eq "$r" fail "an authentication warning counts as a failure"
+	reply_ok '{"Command":"Unknown"}' && r=ok || r=fail
+	assert_eq "$r" fail "an unknown command counts as a failure"
+	reply_ok '' && r=ok || r=fail
+	assert_eq "$r" fail "an empty reply counts as a failure"
+
+	assert_eq "$(hms 45)" 45s "seconds"
+	assert_eq "$(hms 90)" 1m30s "minutes and seconds"
+	assert_eq "$(hms 5400)" 1h30m "hours and minutes"
+	assert_eq "$(mask 'http://h/cm?user=a&password=s3cr3t&cmnd=Power')" \
+		'http://h/cm?user=a&password=***&cmnd=Power' "password never reaches the log"
+	plug_password='s3.cr*t'
+	assert_eq "$(mask 'http://h/relay?pw=s3.cr*t&on=1')" \
+		'http://h/relay?pw=***&on=1' "custom URL: masked under any parameter name"
+	assert_eq "$(mask 'http://admin:s3.cr*t@h/on')" \
+		'http://admin:***@h/on' "custom URL: masked in the userinfo of the URL"
+	plug_password='a&b'
+	assert_eq "$(mask 'http://h/relay?pw=a%26b&on=1')" \
+		'http://h/relay?pw=***&on=1' "masked once percent-encoded too"
+	plug_password=
+
+	assert_eq "$(urlencode 'Backlog Power off; Delay 300; Power on')" \
+		'Backlog%20Power%20off%3B%20Delay%20300%3B%20Power%20on' "Backlog command encoding"
+	assert_eq "$(urlencode 'a%b&c')" 'a%25b%26c' "percent and ampersand encoded in the right order"
+
+	assert_eq "$(json_field '{"POWER":"ON"}' POWER)" ON "reads the relay state"
+	assert_eq "$(json_field '{"PowerOnState":0}' PowerOnState)" 0 "reads a numeric value"
+	assert_eq "$(json_field '{"POWER1":"OFF"}' "$(upper Power1)")" OFF "multi-relay plug"
+
+	plug_host=10.0.0.5 plug_port=8080 plug_user='a&b' plug_password='p|w' off_time=30
+	assert_eq "$(expand_url 'http://{host}:{port}/relay?on')" \
+		'http://10.0.0.5:8080/relay?on' "host and port expansion"
+	assert_eq "$(expand_url '{host}/x?u={user}&p={password}')" \
+		'10.0.0.5/x?u=a%26b&p=p|w' "credentials percent-encoded, sed metacharacters survive"
+	assert_eq "$(expand_url '/cycle?s={off_time}&ds={off_ds}')" \
+		'/cycle?s=30&ds=300' "off_time in seconds and tenths"
+	plug_password=
+
+	# /etc/config/watchplug is a conffile: hand-edited, and it survives upgrades. A bad
+	# value must never reach a ping argument or the state JSON. The stub shadows the
+	# uci binary, so load_config reads exactly what each case feeds it.
+	uci() {
+		case "$3" in
+		*.max_cycles | *.ping_count | *.ping_timeout | *.backoff_max) echo abc ;;
+		*) return 1 ;;
+		esac
+	}
+	load_config
+	assert_eq "$max_cycles" 3 "non-numeric max_cycles cannot break the state JSON"
+	assert_eq "$ping_count" 2 "non-numeric ping_count cannot make every check fail"
+	assert_eq "$ping_timeout" 3 "ping timeout never reaches 0"
+	assert_eq "$backoff_max" 14400 "backoff ceiling never reaches 0"
+
+	# the Delay ceiling is Tasmota's, so it must not shorten a custom cycle URL
+	uci() { case "$3" in *.off_time) echo 10m ;; *.preset) echo tasmota ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$off_time" 360 "Tasmota off time clamped to the Delay ceiling"
+	uci() { case "$3" in *.off_time) echo 10m ;; *.preset) echo custom ;; *) return 1 ;; esac; }
+	load_config
+	assert_eq "$off_time" 600 "custom preset keeps its own off time"
+
+	echo "selftest OK"
+}
+
+usage() {
+	cat <<'EOF'
+usage: watchplug <command>
+
+  daemon              monitoring loop (started by /etc/init.d/watchplug)
+  check               one immediate connectivity check (exit 0 means online)
+  status              last known state, as JSON
+  logs [n]            last n activity lines (default 200)
+  clear-logs          empty the activity log
+  power on|off        drive the controlled device
+  cycle               manual off/on cycle
+  rearm               clear the cycle history (unblocks the 24h cap)
+  fix-poweronstate    force PowerOnState=1 (Tasmota preset only)
+  selftest            check the duration / threshold / URL helpers
+EOF
+}
+
+case "$1" in
+daemon)
+	load_config
+	daemon
+	;;
+check)
+	load_config
+	if check_conn; then
+		echo "online via ${wan_device}"
+	else
+		echo "offline (${wan_device:-no device}) ${message}"
+		exit 1
+	fi
+	;;
+status)
+	cat "$STATE_FILE" 2>/dev/null || echo '{"state":"unknown","message":"daemon has never run"}'
+	;;
+logs)
+	tail -n "${2:-200}" "$LOG_FILE" 2>/dev/null
+	;;
+clear-logs)
+	: >"$LOG_FILE"
+	act "[info ] activity log cleared"
+	echo "activity log cleared"
+	;;
+power)
+	load_config
+	case "$2" in
+	on | off)
+		log info "manual switch $2 requested"
+		device_power "$2"
+		;;
+	*)
+		echo "usage: watchplug power on|off" >&2
+		exit 1
+		;;
+	esac
+	;;
+cycle)
+	load_config
+	cycle_ts=$(date +%s)
+	log info "manual cycle requested"
+	do_cycle || exit 1
+	record_cycle "$cycle_ts"
+	;;
+rearm)
+	cleared=$(wc -w <"$CYCLES_FILE" 2>/dev/null || echo 0)
+	rm -f "$CYCLES_FILE"
+	touch "$REARM_FILE"
+	echo "rearmed, ${cleared:-0} recorded cycle(s) cleared"
+	;;
+fix-poweronstate)
+	load_config
+	[ "$preset" = tasmota ] || {
+		echo "PowerOnState is a Tasmota feature, current preset is '$preset'" >&2
+		exit 1
+	}
+	tasmota "PowerOnState 1"
+	;;
+selftest) selftest ;;
+*)
+	usage
+	exit 1
+	;;
+esac

@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+# The release step attaches the .ipk to the tag, which the default read-only token
+# is not allowed to do.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # make-ipk.sh derives the release number from the commit count
+
+      - name: selftest
+        run: sh package/files/usr/sbin/watchplug selftest
+
+      # Guards the state machine itself -- retry spacing, the 24h cap, rearm, the
+      # outage clock surviving a restart, and that neither preset writes the device
+      # password into the activity log. Nothing else covers any of that.
+      - name: test daemon
+        run: sh test-daemon.sh
+
+      - name: build ipk
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            export VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          sh make-ipk.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-watchplug
+          path: '*.ipk'
+
+      - name: release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.ipk'
+          generate_release_notes: true
