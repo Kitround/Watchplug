@@ -74,3 +74,30 @@ With more than one device, *Settings → With several devices* decides what an o
 has to be back before the router is cut. Any device can be left out of the automatic cycle without
 being deleted, and one that is unreachable does not cancel the others. The 24 h cap and the
 progressive spacing stay global: they count outages, not hardware.
+
+## Development
+
+The repository is an OpenWrt feed: `luci-app-watchplug/` is the package, `htdocs/` goes to `/www`
+and `root/` to the filesystem. Nothing is compiled, and no test file ships in the package.
+
+```bash
+sh luci-app-watchplug/root/usr/sbin/watchplug selftest   # pure helpers, any POSIX shell
+sh test-daemon.sh                                        # the state machine, against stubs
+node test-ui.js                                          # the LuCI view, loaded the way LuCI does
+```
+
+CI runs all three on every push, and they gate every release. `test-ui.js` exists because the other
+two cannot see the page: it loads the view the way LuCI does — the file ends in
+`return view.extend(...)` because LuCI wraps each view in a function — and asserts on what gets
+built. Which settings the Edit dialog contains, that every `depends()` names a field in the same
+form, one titled block per device, and that nothing from the daemon's reply is injected as markup.
+Its fixture is checked against the daemon's own state keys, so it cannot drift.
+
+Releases come from a tag. **Bump `PKG_VERSION` in `luci-app-watchplug/Makefile` first**, or the
+package ships a version contradicting its tag:
+
+```bash
+git tag v1.3.2 && git push origin v1.3.2
+```
+
+CI then runs the three suites, builds both packages with the official OpenWrt SDK and attaches them.
