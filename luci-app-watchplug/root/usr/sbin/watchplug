@@ -368,8 +368,12 @@ device_label() {
 		echo "$dev_name"
 	elif [ -n "$plug_host" ]; then
 		echo "$plug_host"
-	else
+	elif [ "$preset" != tasmota ]; then
 		echo "custom URL"
+	else
+		# A half-filled Tasmota device has no address to show and is not a custom URL
+		# either; its section at least says which row of the table it is.
+		echo "$dev_section"
 	fi
 }
 
@@ -914,7 +918,9 @@ selftest() {
 	dev_name=
 	assert_eq "$(device_label)" 10.0.0.5 "without a name, the address"
 	plug_host= preset=custom
-	assert_eq "$(device_label)" "custom URL" "without either, a constant"
+	assert_eq "$(device_label)" "custom URL" "a custom device with no address says so"
+	preset=tasmota dev_section='@device[3]'
+	assert_eq "$(device_label)" '@device[3]' "a half-filled Tasmota device is not called a custom URL"
 
 	echo "selftest OK"
 }

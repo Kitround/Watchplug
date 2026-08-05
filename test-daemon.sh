@@ -358,6 +358,67 @@ grep -q '192\.0\.2\.50.*Backlog' "$FETCHLOG" || {
 	echo "FAIL: the legacy plug was not cycled" >&2; cat "$FETCHLOG" >&2; exit 1; }
 echo "ok: an un-migrated config keeps being driven"
 
+echo "# the uci-defaults migration converts a pre-multi-device config"
+# This script ships and runs once on upgrade, and nothing had ever executed it. The
+# stub covers the uci verbs it uses, against a flat key=value file.
+MIG=$here/luci-app-watchplug/root/etc/uci-defaults/98-watchplug-devices
+cat >"$tmp/bin/uci" <<EOF
+#!/bin/sh
+CFG="$CFG"
+case "\$1" in
+-q) shift ;;
+esac
+case "\$1" in
+get)
+	# exec, so awk's exit status is the stub's: a plain call would be masked by the
+	# exit 0 below and every "does this section exist" check would answer yes.
+	exec awk -F= -v k="\$2" '\$1 == k { sub(/^[^=]*=/, ""); print; f=1; exit } END { exit !f }' "\$CFG"
+	;;
+add)
+	n=0
+	while grep -Fq "watchplug.@\$3[\$n]=" "\$CFG"; do n=\$((n + 1)); done
+	echo "watchplug.@\$3[\$n]=\$3" >>"\$CFG"
+	echo "@\$3[\$n]"
+	;;
+set)
+	k=\${2%%=*}; v=\${2#*=}
+	grep -Fv "\$k=" "\$CFG" >"\$CFG.n"; mv "\$CFG.n" "\$CFG"
+	echo "\$k=\$v" >>"\$CFG"
+	;;
+delete)
+	grep -Fv "\$2." "\$CFG" | grep -Fv "\$2=" >"\$CFG.n"; mv "\$CFG.n" "\$CFG"
+	;;
+commit) : ;;
+esac
+exit 0
+EOF
+chmod +x "$tmp/bin/uci"
+cat >"$CFG" <<'EOF'
+watchplug.main=watchplug
+watchplug.plug=plug
+watchplug.plug.preset=tasmota
+watchplug.plug.host=192.0.2.77
+watchplug.plug.relay=Power2
+watchplug.plug.password=oldpw
+watchplug.plug.off_time=45s
+EOF
+sh "$MIG" >/dev/null 2>&1
+grep -Fq 'watchplug.@device[0]=device' "$CFG" || {
+	echo "FAIL: migration created no device section" >&2; cat "$CFG" >&2; exit 1; }
+for kv in host=192.0.2.77 relay=Power2 password=oldpw off_time=45s enabled=1; do
+	grep -Fq "watchplug.@device[0].${kv}" "$CFG" || {
+		echo "FAIL: migration lost $kv" >&2; cat "$CFG" >&2; exit 1; }
+done
+grep -Fq 'watchplug.plug' "$CFG" && {
+	echo "FAIL: the old plug section was left behind" >&2; cat "$CFG" >&2; exit 1; }
+echo "ok: settings moved to a device section, old section removed"
+
+before=$(cat "$CFG")
+sh "$MIG" >/dev/null 2>&1
+[ "$before" = "$(cat "$CFG")" ] || {
+	echo "FAIL: running the migration twice changed the config again" >&2; exit 1; }
+echo "ok: running it twice is a no-op"
+
 echo "# clearing the log empties it and says so"
 "$BIN" clear-logs >/dev/null
 [ "$(grep -c . "$LOG")" -eq 1 ] || {

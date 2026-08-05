@@ -28,6 +28,12 @@ jobs:
       - name: daemon
         run: sh test-daemon.sh
 
+      # Loads the LuCI view the way LuCI does and asserts on what it builds. Every
+      # interface regression this project has shipped got past the two steps above:
+      # they cannot see the page at all.
+      - name: interface
+        run: node test-ui.js
+
   # Two packages, not one per release. The app is LUCI_PKGARCH:=all -- shell and
   # JavaScript, no ABI, no versioned dependency -- so what actually splits the
   # releases is the container format, and there are only two of them: opkg's .ipk up
