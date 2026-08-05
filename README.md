@@ -31,7 +31,7 @@ both on a stock image. Below 21.02 it will not work — the UI is client-side Lu
 
 From LuCI, no SSH needed:
 
-1. On the [releases page](https://github.com/Kitround/Watchplug/releases/latest), under **Assets**,
+1. On the [releases page](https://github.com/Kitround/luci-app-watchplug/releases/latest), under **Assets**,
    download the file for your release. Save it on the machine your browser runs on.
 2. **System → Software → Upload Package…**, pick the file, **Install**.
 3. Reload the page. Watchplug appears under **Services → Watchplug**.
